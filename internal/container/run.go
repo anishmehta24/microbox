@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"io/fs"
+	"net"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -19,6 +20,7 @@ import (
 	"syscall"
 
 	"github.com/anishmehta24/microbox/internal/cgroups"
+	"github.com/anishmehta24/microbox/internal/network"
 	"github.com/anishmehta24/microbox/internal/nsinit"
 	"github.com/anishmehta24/microbox/internal/spec"
 )
@@ -29,20 +31,36 @@ const (
 	ContainersDir = "/var/lib/microbox/containers" // one per container: upper, work, merged
 )
 
-// Namespaces every container gets. The network namespace is added in M4.
+// Namespaces every container gets. The network namespace is added unless the
+// container uses the host network.
 const cloneFlags = syscall.CLONE_NEWUTS | // own hostname
 	syscall.CLONE_NEWPID | // own process tree; the first process is PID 1
 	syscall.CLONE_NEWNS | // own mount table, so pivot_root does not touch the host
 	syscall.CLONE_NEWIPC | // own System V IPC and POSIX message queues
 	syscall.CLONE_NEWCGROUP // /proc/self/cgroup and /sys/fs/cgroup start at the container's group
 
-const runUsage = "usage: microbox run [--hostname NAME] [--memory SIZE] [--cpus N] [--pids N] IMAGE COMMAND [ARG...]"
+const runUsage = "usage: microbox run [--hostname NAME] [--memory SIZE] [--cpus N] [--pids N] [--net MODE] [-p HOST:CONTAINER]... IMAGE COMMAND [ARG...]"
 
 type options struct {
 	hostname string
 	image    string
 	argv     []string
 	limits   cgroups.Limits
+	net      network.Mode
+	ports    portsFlag
+}
+
+// portsFlag collects repeated -p flags.
+type portsFlag []network.PortMapping
+
+func (p *portsFlag) String() string { return fmt.Sprint([]network.PortMapping(*p)) }
+
+func (p *portsFlag) Set(s string) error {
+	m, err := network.ParsePort(s)
+	if err == nil {
+		*p = append(*p, m)
+	}
+	return err
 }
 
 // Run implements `microbox run` and returns the exit code for microbox.
@@ -53,6 +71,8 @@ func Run(args []string) int {
 	memory := fl.String("memory", "", "memory limit, e.g. 256m or 1g (no swap on top)")
 	fl.Float64Var(&opts.limits.CPUs, "cpus", 0, "CPU limit in CPUs, e.g. 0.5")
 	fl.Int64Var(&opts.limits.Pids, "pids", 0, "maximum number of processes")
+	netMode := fl.String("net", "bridge", "network: bridge, none or host")
+	fl.Var(&opts.ports, "p", "publish a container TCP port as HOST:CONTAINER (repeatable)")
 	if err := fl.Parse(args); err != nil {
 		return 2
 	}
@@ -63,7 +83,11 @@ func Run(args []string) int {
 	opts.image, opts.argv = fl.Arg(0), fl.Args()[1:]
 
 	var err error
-	if *memory != "" {
+	opts.net, err = network.ParseMode(*netMode)
+	if err == nil && len(opts.ports) > 0 && opts.net != network.Bridge {
+		err = fmt.Errorf("-p needs --net bridge")
+	}
+	if err == nil && *memory != "" {
 		opts.limits.MemoryBytes, err = cgroups.ParseBytes(*memory)
 	}
 	// Written so that NaN fails too: every comparison with NaN is false. 0.01 is
@@ -111,8 +135,6 @@ func run(opts options) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	cfg := spec.Config{ID: id, Hostname: hostname, Rootfs: rootfs, Args: opts.argv, Env: defaultEnv(hostname)}
-
 	cg, err := cgroups.Create(id, opts.limits)
 	if err != nil {
 		return 0, fmt.Errorf("create cgroup: %w", err)
@@ -128,9 +150,34 @@ func run(opts options) (int, error) {
 	}
 	defer cgDir.Close()
 
+	ep, err := network.Prepare(id, opts.net, opts.ports)
+	if err != nil {
+		return 0, fmt.Errorf("network: %w", err)
+	}
+	defer func() {
+		if err := ep.Teardown(); err != nil {
+			fmt.Fprintf(os.Stderr, "microbox: network teardown: %v\n", err)
+		}
+	}()
+	resolvConf, err := os.ReadFile("/etc/resolv.conf")
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return 0, err
+	}
+	if opts.net != network.Host {
+		resolvConf = network.ResolvConf(resolvConf)
+	}
+	cfg := spec.Config{
+		ID:         id,
+		Hostname:   hostname,
+		Rootfs:     rootfs,
+		Args:       opts.argv,
+		Env:        defaultEnv(hostname),
+		Hosts:      hostsFile(hostname, ep.IP),
+		ResolvConf: string(resolvConf),
+	}
+
 	// init reads its config from this pipe and does nothing until it arrives, so
-	// the write is also the "go" signal. M4 moves the network into place between
-	// Start and that write.
+	// the write is also the "go" signal: the network is attached in between.
 	pr, pw, err := os.Pipe()
 	if err != nil {
 		return 0, err
@@ -144,8 +191,12 @@ func run(opts options) (int, error) {
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
 	cmd.ExtraFiles = []*os.File{pr}
 	cmd.Env = []string{} // the container env travels in cfg, keep the host's out
+	flags := uintptr(cloneFlags)
+	if opts.net != network.Host {
+		flags |= syscall.CLONE_NEWNET // own interfaces, routes and firewall, starting with just lo
+	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Cloneflags: cloneFlags,
+		Cloneflags: flags,
 		Pdeathsig:  syscall.SIGKILL, // if microbox dies, the container dies with it
 		// clone3 with CLONE_INTO_CGROUP: the child starts inside its group instead
 		// of being moved there after it is already running. That also makes its
@@ -173,6 +224,13 @@ func run(opts options) (int, error) {
 	pr.Close() // the child has its own copy
 	go forwardSignals(sigs, cmd.Process)
 
+	// init is now blocked on the pipe, inside its new namespaces. Wire up its
+	// network, then let it go.
+	if err := ep.Attach(cmd.Process.Pid); err != nil {
+		cmd.Process.Kill()
+		cmd.Wait()
+		return 0, fmt.Errorf("network: %w", err)
+	}
 	if err := json.NewEncoder(pw).Encode(cfg); err != nil {
 		cmd.Process.Kill()
 		cmd.Wait()
@@ -268,6 +326,18 @@ func newID() (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(b), nil
+}
+
+// hostsFile maps the hostname to the container's address, or to 127.0.1.1
+// (the Debian convention) when it has none.
+func hostsFile(hostname string, ip net.IP) string {
+	self := "127.0.1.1"
+	if ip != nil {
+		self = ip.String()
+	}
+	return "127.0.0.1\tlocalhost\n" +
+		"::1\tlocalhost ip6-localhost ip6-loopback\n" +
+		self + "\t" + hostname + "\n"
 }
 
 func defaultEnv(hostname string) []string {

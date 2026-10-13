@@ -41,17 +41,26 @@ another container, and `ls > /dev/null` works.
 Done when: a memory hog is OOM-killed (`memory.events` counts it), a fork bomb
 is stopped, and `--cpus 0.5` shows up as about 50% CPU in `top`.
 
-## M4: networking
+## M4: networking (done)
 
-- Bridge `mb0` at 10.88.0.1/16 and one veth pair per container. Move one end
-  into the child's network namespace between Start and the config write.
-- File-based IP assignment, a default route, `ip_forward`, iptables MASQUERADE,
-  `-p HOST:CONTAINER` with DNAT, and `/etc/resolv.conf`.
-- Netlink through vishvananda/netlink; configure the namespace with
-  `runtime.LockOSThread()`.
+- Bridge `mb0` at 10.88.0.1/16 and one veth pair per container. The container
+  end is created directly inside the child's network namespace, as `eth0`,
+  between Start and the config write.
+- File-based IP assignment (`O_EXCL`), a default route, `ip_forward`, iptables
+  MASQUERADE, and `/etc/resolv.conf` without loopback nameservers.
+- `-p HOST:CONTAINER` with DNAT in PREROUTING and OUTPUT, plus a proxy on
+  127.0.0.1 for loopback traffic, like docker-proxy.
+- `--net bridge|none|host`.
+- Netlink through vishvananda/netlink. The container's interfaces are
+  configured through a netlink socket opened inside its namespace
+  (`NewHandleAt`), so no thread has to switch namespaces by hand.
 
 Done when: two containers ping each other, reach the internet, and
 `-p 8080:80` serves from the host.
+
+Not covered: UDP ports, IPv6, and reaching a container's published port from
+another container through the host address. That last one needs hairpin NAT
+or `br_netfilter`.
 
 ## M5: lifecycle
 

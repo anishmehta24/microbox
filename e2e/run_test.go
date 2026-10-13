@@ -4,6 +4,7 @@ package e2e
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/anishmehta24/microbox/internal/cgroups"
 	"github.com/anishmehta24/microbox/internal/container"
+	"github.com/anishmehta24/microbox/internal/network"
 )
 
 var (
@@ -58,7 +60,9 @@ func microbox(t *testing.T, args ...string) (string, int) {
 		t.Skip(skipReason)
 	}
 	var out bytes.Buffer
-	cmd := exec.Command(bin, append([]string{"run"}, args...)...)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute) // a hung container fails the test instead of the run
+	defer cancel()
+	cmd := exec.CommandContext(ctx, bin, append([]string{"run"}, args...)...)
 	cmd.Stdout, cmd.Stderr = &out, &out
 	if err := cmd.Run(); err != nil && cmd.ProcessState == nil {
 		t.Fatalf("start microbox: %v", err)
@@ -107,9 +111,9 @@ func TestOnlyContainerProcessesVisible(t *testing.T) {
 }
 
 func TestNamespacesDiffer(t *testing.T) {
-	out := mustRun(t, "alpine", "sh", "-c", "for n in uts pid mnt ipc; do readlink /proc/self/ns/$n; done")
+	out := mustRun(t, "alpine", "sh", "-c", "for n in uts pid mnt ipc cgroup net; do readlink /proc/self/ns/$n; done")
 	inside := strings.Split(out, "\n")
-	for i, ns := range []string{"uts", "pid", "mnt", "ipc"} {
+	for i, ns := range []string{"uts", "pid", "mnt", "ipc", "cgroup", "net"} {
 		host, err := os.Readlink("/proc/self/ns/" + ns)
 		if err != nil {
 			t.Fatal(err)
@@ -170,15 +174,19 @@ func TestEtcFiles(t *testing.T) {
 	if got := mustRun(t, "--hostname", "box2", "alpine", "cat", "/etc/hostname"); got != "box2" {
 		t.Errorf("/etc/hostname = %q, want box2", got)
 	}
-	if got := mustRun(t, "--hostname", "box2", "alpine", "grep", "box2", "/etc/hosts"); got != "127.0.1.1\tbox2" {
-		t.Errorf("/etc/hosts line = %q", got)
+	if got := mustRun(t, "--hostname", "box2", "--net", "none", "alpine", "grep", "box2", "/etc/hosts"); got != "127.0.1.1\tbox2" {
+		t.Errorf("/etc/hosts line without an address = %q", got)
 	}
 	host, err := os.ReadFile("/etc/resolv.conf")
 	if err != nil {
 		t.Skip(err)
 	}
-	if got := mustRun(t, "alpine", "cat", "/etc/resolv.conf"); got != strings.TrimSpace(string(host)) {
-		t.Errorf("/etc/resolv.conf = %q, want the host's", got)
+	want := strings.TrimSpace(string(network.ResolvConf(host)))
+	if got := mustRun(t, "alpine", "cat", "/etc/resolv.conf"); got != want {
+		t.Errorf("/etc/resolv.conf = %q, want %q", got, want)
+	}
+	if got := mustRun(t, "--net", "host", "alpine", "cat", "/etc/resolv.conf"); got != strings.TrimSpace(string(host)) {
+		t.Errorf("/etc/resolv.conf with --net host = %q, want the host's unchanged", got)
 	}
 }
 
