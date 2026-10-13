@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"os/exec"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -37,6 +38,9 @@ func (p PortMapping) String() string { return fmt.Sprintf("%d:%d", p.Host, p.Con
 //     packet from a loopback address out of another interface. A small proxy
 //     in microbox listens there instead, like docker-proxy. Holding that port
 //     also stops a second container from publishing the same one.
+//
+// The rules carry the container ID in a comment, which is how Cleanup finds
+// them again.
 func (e *Endpoint) publish(p PortMapping) error {
 	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", p.Host))
 	if err != nil {
@@ -47,7 +51,9 @@ func (e *Endpoint) publish(p PortMapping) error {
 	go proxy(ln, target)
 
 	dnat := []string{"-p", "tcp", "--dport", strconv.Itoa(p.Host),
-		"-m", "addrtype", "--dst-type", "LOCAL", "-j", "DNAT", "--to-destination", target}
+		"-m", "addrtype", "--dst-type", "LOCAL",
+		"-m", "comment", "--comment", ownerPrefix + e.id,
+		"-j", "DNAT", "--to-destination", target}
 	for _, r := range []rule{
 		{"nat", "PREROUTING", dnat},
 		{"nat", "OUTPUT", append([]string{"!", "-d", "127.0.0.0/8"}, dnat...)},
@@ -55,7 +61,6 @@ func (e *Endpoint) publish(p PortMapping) error {
 		if err := r.add(); err != nil {
 			return err
 		}
-		e.rules = append(e.rules, r)
 	}
 	return nil
 }
@@ -111,6 +116,43 @@ func (r rule) ensure(insert bool) error {
 		return iptables(r.table, "-I", r.chain, r.spec)
 	}
 	return r.add()
+}
+
+// ownerPrefix starts the comment on a container's own rules: microbox:<id>.
+const ownerPrefix = "microbox:"
+
+// listRules finds the containers' rules in the nat table by their comment.
+func listRules() (map[string][]rule, error) {
+	out, err := exec.Command("iptables", "-w", "-t", "nat", "-S").Output()
+	if err != nil {
+		return nil, fmt.Errorf("iptables -t nat -S: %w", err)
+	}
+	return parseRules(string(out)), nil
+}
+
+// parseRules reads iptables -S output, which prints each rule in the syntax
+// that adds it: "-A CHAIN spec...". The same spec after -D deletes it.
+func parseRules(out string) map[string][]rule {
+	rules := map[string][]rule{}
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Fields(line)
+		if len(f) < 2 || f[0] != "-A" {
+			continue
+		}
+		i := slices.Index(f, "--comment")
+		if i < 0 || i+1 == len(f) {
+			continue
+		}
+		// iptables-nft prints the comment in quotes. None of microbox's rules
+		// has a space in it, so the fields need nothing more than unquoting.
+		id, ok := strings.CutPrefix(strings.Trim(f[i+1], `"`), ownerPrefix)
+		if !ok {
+			continue
+		}
+		f[i+1] = ownerPrefix + id
+		rules[id] = append(rules[id], rule{"nat", f[1], f[2:]})
+	}
+	return rules
 }
 
 // iptables runs one iptables command. -w waits for the xtables lock instead of

@@ -12,6 +12,8 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
+	"time"
 )
 
 const (
@@ -149,11 +151,55 @@ func (c *Cgroup) OOMKills() (int64, error) {
 	return 0, sc.Err()
 }
 
+// Lookup returns the group of container id, whether or not it exists.
+func Lookup(id string) *Cgroup {
+	return &Cgroup{Path: filepath.Join(Parent, id)}
+}
+
 // Remove deletes the group. The kernel only allows that once it has no
 // processes left, which is the case after the container's PID 1 is reaped:
 // the PID namespace dies with it.
 func (c *Cgroup) Remove() error {
 	return os.Remove(c.Path)
+}
+
+// Kill sends SIGKILL to every process in the group at once, through
+// cgroup.kill (Linux 5.14+). Processes that microbox exec started are in the
+// group too, and so is anything they forked, even mid-fork.
+func (c *Cgroup) Kill() error {
+	f, err := os.OpenFile(filepath.Join(c.Path, "cgroup.kill"), os.O_WRONLY, 0)
+	if err != nil {
+		return err
+	}
+	_, err = f.WriteString("1")
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	return err
+}
+
+// Destroy kills whatever is left in the group and removes it. It cleans up
+// after a supervisor that died: normally the group is already empty when it
+// is removed. A group that doesn't exist is not an error.
+func (c *Cgroup) Destroy() error {
+	if err := c.Kill(); errors.Is(err, fs.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	// The kill is asynchronous, and rmdir fails with EBUSY until the last
+	// process is gone.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		err := os.Remove(c.Path)
+		if err == nil || errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		if !errors.Is(err, syscall.EBUSY) || time.Now().After(deadline) {
+			return err
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }
 
 // ParseBytes reads a size like 512k, 256m or 1g (powers of 1024) or a plain

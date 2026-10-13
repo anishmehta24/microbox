@@ -43,7 +43,7 @@ func TestContainersReachEachOther(t *testing.T) {
 	if skipReason != "" {
 		t.Skip(skipReason)
 	}
-	a := exec.Command(bin, "run", "alpine", "sh", "-c", "ip -4 addr show eth0; nc -l -p 7000")
+	a := exec.Command(bin, "run", "--rm", "alpine", "sh", "-c", "ip -4 addr show eth0; nc -l -p 7000")
 	stdout, err := a.StdoutPipe()
 	if err != nil {
 		t.Fatal(err)
@@ -95,7 +95,7 @@ func TestPublishedPort(t *testing.T) {
 		t.Skip(skipReason)
 	}
 	const port = "18080"
-	ctr := exec.Command(bin, "run", "-p", port+":80", "alpine", "sh", "-c",
+	ctr := exec.Command(bin, "run", "--rm", "-p", port+":80", "alpine", "sh", "-c",
 		`for i in 1 2; do printf "HTTP/1.0 200 OK\r\nContent-Length: 6\r\n\r\nhello\n" | nc -l -p 80 -w 1 >/dev/null; done`)
 	ctr.Stdout, ctr.Stderr = os.Stderr, os.Stderr
 	if err := ctr.Start(); err != nil {
