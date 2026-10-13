@@ -86,6 +86,9 @@ var specialMounts = []mount{
 	{"proc", "/proc", "proc", syscall.MS_NOSUID | syscall.MS_NODEV | syscall.MS_NOEXEC, ""},
 	// Read-only, so the container can look at devices and kernel settings but not change them.
 	{"sysfs", "/sys", "sysfs", syscall.MS_RDONLY | syscall.MS_NOSUID | syscall.MS_NODEV | syscall.MS_NOEXEC, ""},
+	// Mounted from inside the cgroup namespace, so its root is the container's
+	// own group: the container can read its limits and usage but not raise them.
+	{"cgroup2", "/sys/fs/cgroup", "cgroup2", syscall.MS_RDONLY | syscall.MS_NOSUID | syscall.MS_NODEV | syscall.MS_NOEXEC, ""},
 	// An empty /dev that only gets the devices below, not the host's disks.
 	{"tmpfs", "/dev", "tmpfs", syscall.MS_NOSUID | syscall.MS_STRICTATIME, "mode=755,size=65536k"},
 	// newinstance: the container's own pty numbering, without the host's terminals.

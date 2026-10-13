@@ -10,9 +10,15 @@ import (
 	"github.com/anishmehta24/microbox/internal/nsinit"
 )
 
-const usage = `usage: microbox run [--hostname NAME] IMAGE COMMAND [ARG...]
+const usage = `usage: microbox run [OPTIONS] IMAGE COMMAND [ARG...]
 
 IMAGE is a directory under /var/lib/microbox/images, or a path to a root filesystem.
+
+Options:
+  --hostname NAME   container hostname (default: the container ID)
+  --memory SIZE     memory limit, e.g. 256m or 1g; no swap on top
+  --cpus N          CPU limit, e.g. 0.5 for half of one CPU
+  --pids N          maximum number of processes
 `
 
 func main() {

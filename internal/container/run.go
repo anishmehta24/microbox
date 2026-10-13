@@ -18,6 +18,7 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/anishmehta24/microbox/internal/cgroups"
 	"github.com/anishmehta24/microbox/internal/nsinit"
 	"github.com/anishmehta24/microbox/internal/spec"
 )
@@ -28,25 +29,55 @@ const (
 	ContainersDir = "/var/lib/microbox/containers" // one per container: upper, work, merged
 )
 
-// Namespaces every container gets. Cgroup (M3) and network (M4) namespaces are
-// added by later milestones.
+// Namespaces every container gets. The network namespace is added in M4.
 const cloneFlags = syscall.CLONE_NEWUTS | // own hostname
 	syscall.CLONE_NEWPID | // own process tree; the first process is PID 1
 	syscall.CLONE_NEWNS | // own mount table, so pivot_root does not touch the host
-	syscall.CLONE_NEWIPC // own System V IPC and POSIX message queues
+	syscall.CLONE_NEWIPC | // own System V IPC and POSIX message queues
+	syscall.CLONE_NEWCGROUP // /proc/self/cgroup and /sys/fs/cgroup start at the container's group
+
+const runUsage = "usage: microbox run [--hostname NAME] [--memory SIZE] [--cpus N] [--pids N] IMAGE COMMAND [ARG...]"
+
+type options struct {
+	hostname string
+	image    string
+	argv     []string
+	limits   cgroups.Limits
+}
 
 // Run implements `microbox run` and returns the exit code for microbox.
 func Run(args []string) int {
+	var opts options
 	fl := flag.NewFlagSet("run", flag.ContinueOnError)
-	hostname := fl.String("hostname", "", "container hostname (default: the container ID)")
+	fl.StringVar(&opts.hostname, "hostname", "", "container hostname (default: the container ID)")
+	memory := fl.String("memory", "", "memory limit, e.g. 256m or 1g (no swap on top)")
+	fl.Float64Var(&opts.limits.CPUs, "cpus", 0, "CPU limit in CPUs, e.g. 0.5")
+	fl.Int64Var(&opts.limits.Pids, "pids", 0, "maximum number of processes")
 	if err := fl.Parse(args); err != nil {
 		return 2
 	}
 	if fl.NArg() < 2 {
-		fmt.Fprintln(os.Stderr, "usage: microbox run [--hostname NAME] IMAGE COMMAND [ARG...]")
+		fmt.Fprintln(os.Stderr, runUsage)
 		return 2
 	}
-	code, err := run(*hostname, fl.Arg(0), fl.Args()[1:])
+	opts.image, opts.argv = fl.Arg(0), fl.Args()[1:]
+
+	var err error
+	if *memory != "" {
+		opts.limits.MemoryBytes, err = cgroups.ParseBytes(*memory)
+	}
+	if err == nil && opts.limits.CPUs != 0 && opts.limits.CPUs < 0.01 {
+		err = fmt.Errorf("--cpus must be at least 0.01, the kernel's 1ms minimum quota")
+	}
+	if err == nil && opts.limits.Pids < 0 {
+		err = fmt.Errorf("--pids must be positive")
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "microbox: %v\n", err)
+		return 2
+	}
+
+	code, err := run(opts)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "microbox: %v\n", err)
 		return spec.ExitRuntimeError
@@ -54,11 +85,11 @@ func Run(args []string) int {
 	return code
 }
 
-func run(hostname, image string, argv []string) (int, error) {
+func run(opts options) (int, error) {
 	if os.Geteuid() != 0 {
 		return 0, errors.New("must run as root: new namespaces, mounts and pivot_root need CAP_SYS_ADMIN")
 	}
-	imageDir, err := resolveImage(image)
+	imageDir, err := resolveImage(opts.image)
 	if err != nil {
 		return 0, err
 	}
@@ -66,6 +97,7 @@ func run(hostname, image string, argv []string) (int, error) {
 	if err != nil {
 		return 0, err
 	}
+	hostname := opts.hostname
 	if hostname == "" {
 		hostname = id
 	}
@@ -77,11 +109,26 @@ func run(hostname, image string, argv []string) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	cfg := spec.Config{ID: id, Hostname: hostname, Rootfs: rootfs, Args: argv, Env: defaultEnv(hostname)}
+	cfg := spec.Config{ID: id, Hostname: hostname, Rootfs: rootfs, Args: opts.argv, Env: defaultEnv(hostname)}
+
+	cg, err := cgroups.Create(id, opts.limits)
+	if err != nil {
+		return 0, fmt.Errorf("create cgroup: %w", err)
+	}
+	defer func() {
+		if err := cg.Remove(); err != nil {
+			fmt.Fprintf(os.Stderr, "microbox: remove cgroup: %v\n", err)
+		}
+	}()
+	cgDir, err := os.Open(cg.Path)
+	if err != nil {
+		return 0, err
+	}
+	defer cgDir.Close()
 
 	// init reads its config from this pipe and does nothing until it arrives, so
-	// the write is also the "go" signal. Later milestones put the child into its
-	// cgroup and network namespace between Start and that write.
+	// the write is also the "go" signal. M4 moves the network into place between
+	// Start and that write.
 	pr, pw, err := os.Pipe()
 	if err != nil {
 		return 0, err
@@ -98,6 +145,11 @@ func run(hostname, image string, argv []string) (int, error) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Cloneflags: cloneFlags,
 		Pdeathsig:  syscall.SIGKILL, // if microbox dies, the container dies with it
+		// clone3 with CLONE_INTO_CGROUP: the child starts inside its group instead
+		// of being moved there after it is already running. That also makes its
+		// new cgroup namespace start at that group rather than at microbox's.
+		UseCgroupFD: true,
+		CgroupFD:    int(cgDir.Fd()),
 	}
 
 	// Pdeathsig fires when the thread that forked the child exits, not the whole
@@ -130,6 +182,9 @@ func run(hostname, image string, argv []string) (int, error) {
 	var exitErr *exec.ExitError
 	if err != nil && !errors.As(err, &exitErr) {
 		return 0, fmt.Errorf("wait for container: %w", err)
+	}
+	if n, err := cg.OOMKills(); err == nil && n > 0 {
+		fmt.Fprintf(os.Stderr, "microbox: container reached its memory limit; the OOM killer killed %d process(es)\n", n)
 	}
 	return exitCode(cmd.ProcessState), nil
 }
