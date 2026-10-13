@@ -66,8 +66,10 @@ func Run(args []string) int {
 	if *memory != "" {
 		opts.limits.MemoryBytes, err = cgroups.ParseBytes(*memory)
 	}
-	if err == nil && opts.limits.CPUs != 0 && opts.limits.CPUs < 0.01 {
-		err = fmt.Errorf("--cpus must be at least 0.01, the kernel's 1ms minimum quota")
+	// Written so that NaN fails too: every comparison with NaN is false. 0.01 is
+	// the kernel's 1 ms minimum quota; the top end is Docker's limit.
+	if c := opts.limits.CPUs; err == nil && c != 0 && !(c >= 0.01 && c <= float64(runtime.NumCPU())) {
+		err = fmt.Errorf("--cpus must be between 0.01 and %d, the number of CPUs", runtime.NumCPU())
 	}
 	if err == nil && opts.limits.Pids < 0 {
 		err = fmt.Errorf("--pids must be positive")

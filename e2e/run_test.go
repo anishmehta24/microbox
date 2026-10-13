@@ -377,6 +377,10 @@ func TestBadLimitFlags(t *testing.T) {
 	for _, args := range [][]string{
 		{"--memory", "10x", "alpine", "true"},
 		{"--cpus", "0.001", "alpine", "true"},
+		{"--cpus", "NaN", "alpine", "true"},
+		{"--cpus", "+Inf", "alpine", "true"},
+		{"--cpus", "100000", "alpine", "true"},
+		{"--cpus", "-1", "alpine", "true"},
 		{"--pids", "-1", "alpine", "true"},
 	} {
 		if out, code := microbox(t, args...); code != 2 {
