@@ -39,18 +39,21 @@ type Rootfs struct {
 // File descriptors the runtime passes to init and exec-init, as entries of
 // exec.Cmd.ExtraFiles: entry i always lands on fd 3+i.
 const (
+	// ExeFD is the sealed copy of microbox's binary the process was
+	// started from. The process closes it first thing.
+	ExeFD = 3
 	// InitPipeFD is where init reads its Config, and exec-init its Process.
-	InitPipeFD = 3
+	InitPipeFD = 4
 
 	// StartedFD (init only) is the write end of a pipe the runtime reads
 	// until it closes. It closes once the command runs: with the exec, or
-	// with --init once init handles signals. Only then does the runtime
-	// treat the container as running, because until then a signal reaches
-	// microbox's own code instead of the command.
-	StartedFD = 4
+	// with --init once the reaper handles signals. Only then does the
+	// runtime treat the container as running, because until then a signal
+	// reaches microbox's own code instead of the command.
+	StartedFD = 5
 
 	// ExecNamespaceFD (exec-init only) is the first of ExecNamespaces.
-	ExecNamespaceFD = 4
+	ExecNamespaceFD = 5
 )
 
 // ExecNamespaces are the namespaces exec-init joins itself, in this order,

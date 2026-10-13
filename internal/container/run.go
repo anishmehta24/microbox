@@ -131,6 +131,11 @@ func create(opts options) (*Container, error) {
 	if os.Geteuid() != 0 {
 		return nil, errors.New("must run as root: new namespaces, mounts and pivot_root need CAP_SYS_ADMIN")
 	}
+	if opts.init {
+		if err := checkStatic(); err != nil {
+			return nil, err
+		}
+	}
 	imageDir, err := resolveImage(opts.image)
 	if err != nil {
 		return nil, err
@@ -230,8 +235,8 @@ func detach(c *Container) int {
 
 	cmd := exec.Command("/proc/self/exe", ShimCommand, c.ID)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = devNull, logFile, logFile
-	cmd.ExtraFiles = []*os.File{pw}
-	cmd.Dir = "/" // don't keep the caller's working directory busy
+	cmd.ExtraFiles = []*os.File{pw} // shimReadyFD
+	cmd.Dir = "/"                   // don't keep the caller's working directory busy
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	err = cmd.Start()
 	pw.Close()
@@ -252,13 +257,18 @@ func detach(c *Container) int {
 	return 0
 }
 
-const shimReady = "ok"
+// The shim writes shimReady to the pipe on shimReadyFD once the container
+// runs, or the error if it couldn't start it.
+const (
+	shimReady   = "ok"
+	shimReadyFD = 3
+)
 
 // Shim is the supervisor of a detached container, started by detach. Its
 // stdout and stderr are the container's log file.
 func Shim(args []string) int {
 	runtime.LockOSThread() // for Pdeathsig, see foreground
-	ready := os.NewFile(spec.InitPipeFD, "ready")
+	ready := os.NewFile(shimReadyFD, "ready")
 	if len(args) != 1 {
 		fmt.Fprintf(ready, "usage: microbox %s ID", ShimCommand)
 		return 2
@@ -341,14 +351,19 @@ func start(c *Container, stdin, stdout, stderr *os.File) (_ *instance, err error
 		return nil, err
 	}
 	defer started.Close()
+	exe, err := sealedCopy()
+	if err != nil {
+		return nil, err
+	}
+	defer exe.Close()
 
 	// The Go runtime is multithreaded, and a multithreaded process cannot move
 	// itself into a new mount namespace. So instead of unsharing in place,
 	// microbox starts a fresh copy of itself with clone flags.
-	cmd := exec.Command("/proc/self/exe", nsinit.Command)
+	cmd := exec.Command(exePath, nsinit.Command)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = stdin, stdout, stderr
-	cmd.ExtraFiles = []*os.File{pr, startedW} // spec.InitPipeFD, spec.StartedFD
-	cmd.Env = []string{}                      // the container env travels in the config, keep the host's out
+	cmd.ExtraFiles = []*os.File{exe, pr, startedW} // spec.ExeFD, InitPipeFD, StartedFD
+	cmd.Env = []string{}                           // the container env travels in the config, keep the host's out
 	flags := uintptr(cloneFlags)
 	if c.Net != network.Host {
 		flags |= syscall.CLONE_NEWNET // own interfaces, routes and firewall, starting with just lo

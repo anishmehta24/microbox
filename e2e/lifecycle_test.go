@@ -143,8 +143,8 @@ func TestInitForwardsSignals(t *testing.T) {
 		t.Errorf("ps line after stop: %q", line)
 	}
 	ps := mustCLI(t, "exec", runDetached(t, "--init", "alpine", "sleep", "60"), "ps", "-o", "pid,args")
-	if !regexp.MustCompile(`(?m)^\s+1 /proc/self/exe init$`).MatchString(ps) || !regexp.MustCompile(`(?m)^\s+\d+ sleep 60$`).MatchString(ps) {
-		t.Errorf("with --init, PID 1 should be microbox's init and sleep its child:\n%s", ps)
+	if !regexp.MustCompile(`(?m)^\s+1 .*microbox reap sleep 60$`).MatchString(ps) || !regexp.MustCompile(`(?m)^\s+\d+ sleep 60$`).MatchString(ps) {
+		t.Errorf("with --init, PID 1 should be microbox's reaper and sleep its child:\n%s", ps)
 	}
 }
 

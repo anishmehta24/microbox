@@ -19,6 +19,7 @@ import (
 	"github.com/anishmehta24/microbox/internal/cgroups"
 	"github.com/anishmehta24/microbox/internal/container"
 	"github.com/anishmehta24/microbox/internal/network"
+	"github.com/anishmehta24/microbox/internal/nsinit"
 )
 
 var (
@@ -43,6 +44,7 @@ func TestMain(m *testing.M) {
 	}
 	bin = filepath.Join(dir, "microbox")
 	build := exec.Command("go", "build", "-o", bin, "../cmd/microbox")
+	build.Env = append(os.Environ(), "CGO_ENABLED=0") // static, as make build does
 	build.Stdout, build.Stderr = os.Stderr, os.Stderr
 	if err := build.Run(); err != nil {
 		fmt.Fprintln(os.Stderr, "build microbox:", err)
@@ -159,11 +161,27 @@ func TestMounts(t *testing.T) {
 		"/dev/shm tmpfs",
 		"/dev/mqueue mqueue",
 	}
+	readOnly := map[string]bool{"/sys": true, "/sys/fs/cgroup": true}
+	// Then the masked and read-only paths this kernel has: a tmpfs, or
+	// /dev/null from the container's /dev tmpfs, over each masked one, and a
+	// read-only bind of /proc's own files over each read-only one.
+	for _, p := range nsinit.MaskedPaths {
+		if fi, err := os.Stat(p); err == nil {
+			want = append(want, p+" tmpfs")
+			readOnly[p] = fi.IsDir()
+		}
+	}
+	for _, p := range nsinit.ReadonlyPaths {
+		if _, err := os.Stat(p); err == nil {
+			want = append(want, p+" proc")
+			readOnly[p] = true
+		}
+	}
 	var got []string
 	for _, line := range strings.Split(mustRun(t, "alpine", "cat", "/proc/mounts"), "\n") {
 		f := strings.Fields(line) // source target fstype options ...
 		got = append(got, f[1]+" "+f[2])
-		if (f[1] == "/sys" || f[1] == "/sys/fs/cgroup") && !strings.HasPrefix(f[3], "ro,") {
+		if readOnly[f[1]] && !strings.HasPrefix(f[3], "ro,") {
 			t.Errorf("%s is mounted %s, want read-only", f[1], f[3])
 		}
 	}
