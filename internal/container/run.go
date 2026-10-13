@@ -335,14 +335,20 @@ func start(c *Container, stdin, stdout, stderr *os.File) (_ *instance, err error
 		return nil, err
 	}
 	defer pw.Close()
+	// init closes its end of this one when the command runs, see spec.StartedFD.
+	started, startedW, err := os.Pipe()
+	if err != nil {
+		return nil, err
+	}
+	defer started.Close()
 
 	// The Go runtime is multithreaded, and a multithreaded process cannot move
 	// itself into a new mount namespace. So instead of unsharing in place,
 	// microbox starts a fresh copy of itself with clone flags.
 	cmd := exec.Command("/proc/self/exe", nsinit.Command)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = stdin, stdout, stderr
-	cmd.ExtraFiles = []*os.File{pr}
-	cmd.Env = []string{} // the container env travels in the config, keep the host's out
+	cmd.ExtraFiles = []*os.File{pr, startedW} // spec.InitPipeFD, spec.StartedFD
+	cmd.Env = []string{}                      // the container env travels in the config, keep the host's out
 	flags := uintptr(cloneFlags)
 	if c.Net != network.Host {
 		flags |= syscall.CLONE_NEWNET // own interfaces, routes and firewall, starting with just lo
@@ -363,7 +369,8 @@ func start(c *Container, stdin, stdout, stderr *os.File) (_ *instance, err error
 	signal.Notify(in.sigs, syscall.SIGINT, syscall.SIGQUIT, syscall.SIGTERM, syscall.SIGHUP)
 
 	err = cmd.Start()
-	pr.Close() // the child has its own copy
+	pr.Close() // the child has its own copies
+	startedW.Close()
 	if err != nil {
 		return nil, fmt.Errorf("start init: %w", err)
 	}
@@ -371,19 +378,24 @@ func start(c *Container, stdin, stdout, stderr *os.File) (_ *instance, err error
 	go forwardSignals(in.sigs, cmd.Process)
 
 	// init is now blocked on the pipe, inside its new namespaces. Wire up its
-	// network, record it as running, then let it go.
+	// network, then let it go.
 	if err := in.ep.Attach(cmd.Process.Pid); err != nil {
 		return nil, fmt.Errorf("network: %w", err)
 	}
 	if c.Pid1, err = procOf(cmd.Process.Pid); err != nil {
 		return nil, err
 	}
+	if err := json.NewEncoder(pw).Encode(c.Config); err != nil {
+		return nil, fmt.Errorf("send config to init: %w", err)
+	}
+	// Until the command runs, PID 1 is still microbox's init. A command that
+	// fails to start lands here as well, and wait records its exit code.
+	if _, err := io.Copy(io.Discard, started); err != nil {
+		return nil, err
+	}
 	c.Status = Running
 	if err := c.save(); err != nil {
 		return nil, err
-	}
-	if err := json.NewEncoder(pw).Encode(c.Config); err != nil {
-		return nil, fmt.Errorf("send config to init: %w", err)
 	}
 	return in, nil
 }

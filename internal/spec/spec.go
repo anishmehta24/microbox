@@ -36,16 +36,27 @@ type Rootfs struct {
 	Merged string `json:"merged"` // where the overlay is mounted; becomes /
 }
 
-// InitPipeFD is the file descriptor init reads its Config from. It is the first
-// entry of exec.Cmd.ExtraFiles, which always lands on fd 3.
-const InitPipeFD = 3
+// File descriptors the runtime passes to init and exec-init, as entries of
+// exec.Cmd.ExtraFiles: entry i always lands on fd 3+i.
+const (
+	// InitPipeFD is where init reads its Config, and exec-init its Process.
+	InitPipeFD = 3
+
+	// StartedFD (init only) is the write end of a pipe the runtime reads
+	// until it closes. It closes once the command runs: with the exec, or
+	// with --init once init handles signals. Only then does the runtime
+	// treat the container as running, because until then a signal reaches
+	// microbox's own code instead of the command.
+	StartedFD = 4
+
+	// ExecNamespaceFD (exec-init only) is the first of ExecNamespaces.
+	ExecNamespaceFD = 4
+)
 
 // ExecNamespaces are the namespaces exec-init joins itself, in this order,
-// from file descriptors that start at ExecNamespaceFD. Mount is last: after
-// it, the process no longer sees the host's /proc.
+// from ExecNamespaceFD on. Mount is last: after it, the process no longer
+// sees the host's /proc.
 var ExecNamespaces = []string{"ipc", "uts", "net", "cgroup", "mnt"}
-
-const ExecNamespaceFD = 4
 
 // Exit codes for failures before the user's command runs. Same meaning as in
 // docker run: 125 is a runtime error, 126 means the command could not be

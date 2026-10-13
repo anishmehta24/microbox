@@ -29,6 +29,10 @@ func reap(p spec.Process) error {
 	// Before Start, so no SIGCHLD can be missed.
 	sigs := make(chan os.Signal, 32)
 	signal.Notify(sigs)
+	// From here on signals are handled, so the runtime may send them: tell it
+	// the container has started (see spec.StartedFD). Closed before Start,
+	// so the command doesn't inherit it.
+	syscall.Close(spec.StartedFD)
 
 	cmd := exec.Command(path)
 	cmd.Args, cmd.Env = p.Args, p.Env

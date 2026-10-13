@@ -139,10 +139,14 @@ One binary, two processes.
    - Through a netlink socket opened inside the container's namespace, it
      brings `lo` up and gives `eth0` its address and a default route via
      10.88.0.1.
-6. Records the container as running, with the host PID of its init, and
-   writes the config as JSON into the pipe (fd 3 in the child). It includes
+6. Writes the config as JSON into the pipe (fd 3 in the child). It includes
    `/etc/hosts` with the container's address, and the host's `resolv.conf`
-   without loopback nameservers, which the container can't reach.
+   without loopback nameservers, which the container can't reach. Then it
+   waits for init to exec the command, and only after that records the
+   container as running, with the host PID of its init. Until the exec,
+   PID 1 is still microbox's init, and a signal from `stop` would hit init
+   instead of the command. The wait uses a second pipe: init holds its write
+   end with close-on-exec set, so the exec closes it and the read returns.
 7. Waits, reports any OOM kills from `memory.events`, then removes the port
    rules, the proxy, the veth, the address and the cgroup, records the exit
    code, and exits with it. With `--rm` it also removes the container's

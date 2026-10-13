@@ -88,8 +88,9 @@ func run() error {
 		return err
 	}
 	if cfg.Init {
-		return reap(cfg.Process)
+		return reap(cfg.Process) // closes spec.StartedFD once it handles signals
 	}
+	syscall.CloseOnExec(spec.StartedFD) // closed by the exec, see spec.StartedFD
 	return execCommand(cfg.Process)
 }
 
