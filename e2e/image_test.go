@@ -75,6 +75,12 @@ func TestPullAndRun(t *testing.T) {
 	if out, code := microbox(t, "--user", "nosuchuser", ref, "true"); code != 125 || !strings.Contains(out, `user "nosuchuser" isn't in the image's /etc/passwd`) {
 		t.Errorf("unknown user: exit %d\n%s", code, out)
 	}
+	// exec and --init's PID 1 run as the container's user too.
+	id := runDetached(t, "--init", ref, "sleep", "60")
+	if got := mustCLI(t, "exec", id, "sh", "-c", "id -u; pwd; stat -c %u /proc/1"); got != "1000\n/opt\n1000" {
+		t.Errorf("exec: %q, want user 1000 in /opt, and PID 1 as 1000", got)
+	}
+	mustCLI(t, "rm", "-f", id)
 
 	// Pulling again sends only HEAD requests for the manifest.
 	gets := reg.Count("GET ")

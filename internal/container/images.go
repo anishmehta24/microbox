@@ -8,7 +8,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strings"
 	"syscall"
 	"text/tabwriter"
 
@@ -44,7 +43,7 @@ func Images(args []string) int {
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
 	fmt.Fprintln(w, "IMAGE\tID\tLAYERS\tSIZE")
 	for _, img := range imgs {
-		fmt.Fprintf(w, "%s\t%s\t%d\t%.1f MB\n", img.Ref, strings.TrimPrefix(img.ID, "sha256:")[:12], len(img.Layers), float64(img.Size)/(1<<20))
+		fmt.Fprintf(w, "%s\t%s\t%d\t%.1f MB\n", img.Ref, img.ShortID(), len(img.Layers), float64(img.Size)/(1<<20))
 	}
 	dirs, err := os.ReadDir(ImagesDir)
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {

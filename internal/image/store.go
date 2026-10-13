@@ -63,6 +63,9 @@ func (img *Image) LowerDirs() []string {
 	return dirs
 }
 
+// ShortID is the first 12 hex digits of the ID, as docker shows it.
+func (img *Image) ShortID() string { return short(img.ID) }
+
 // complete reports whether all the image's layers are unpacked.
 func (img *Image) complete() bool {
 	for _, d := range img.LowerDirs() {
