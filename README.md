@@ -138,7 +138,7 @@ process, as in docker:
 - init creates the working directory if needed and changes to it.
 - It looks the user up in the image's `/etc/passwd` and `/etc/group`, sets
   the groups, GID and UID, and execs. A user other than root ends up with no
-  capabilities, as in docker.
+  capabilities, as in docker. `exec` runs its command the same way.
 
 Not supported: zstd layers, private registries (no credentials), pulling by
 digest, and xattrs from layers other than the opaque marker, such as file
@@ -185,7 +185,7 @@ the same stop takes milliseconds and the exit code is 143.
 | `ps [-a]` | running containers, or all of them |
 | `stop [-t SECONDS] CONTAINER...` | SIGTERM to PID 1, then SIGKILL to every process in the container after the timeout (default 10) |
 | `rm [-f] CONTAINER...` | remove stopped containers; `-f` kills running ones first |
-| `exec CONTAINER COMMAND...` | run another command inside a running container, exiting with its code |
+| `exec CONTAINER COMMAND...` | run another command inside a running container, as its user and in its working directory, exiting with its code |
 | `logs [-f] CONTAINER` | the output of a `-d` container; `-f` follows it until the container exits |
 | `gc` | clean up after microbox processes that were killed (see below) |
 
