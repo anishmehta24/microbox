@@ -22,8 +22,11 @@ import (
 	"github.com/anishmehta24/microbox/internal/spec"
 )
 
-// ImagesDir holds unpacked root filesystems, one directory per image.
-const ImagesDir = "/var/lib/microbox/images"
+// Image and container directories on the host.
+const (
+	ImagesDir     = "/var/lib/microbox/images"     // unpacked root filesystems, one per image
+	ContainersDir = "/var/lib/microbox/containers" // one per container: upper, work, merged
+)
 
 // Namespaces every container gets. Cgroup (M3) and network (M4) namespaces are
 // added by later milestones.
@@ -55,7 +58,7 @@ func run(hostname, image string, argv []string) (int, error) {
 	if os.Geteuid() != 0 {
 		return 0, errors.New("must run as root: new namespaces, mounts and pivot_root need CAP_SYS_ADMIN")
 	}
-	rootfs, err := resolveImage(image)
+	imageDir, err := resolveImage(image)
 	if err != nil {
 		return 0, err
 	}
@@ -65,6 +68,14 @@ func run(hostname, image string, argv []string) (int, error) {
 	}
 	if hostname == "" {
 		hostname = id
+	}
+	// Containers only run in the foreground for now, so the writable layer goes
+	// away with the container, like docker run --rm. M5 keeps it until rm.
+	dir := filepath.Join(ContainersDir, id)
+	defer os.RemoveAll(dir)
+	rootfs, err := prepareRootfs(dir, imageDir)
+	if err != nil {
+		return 0, err
 	}
 	cfg := spec.Config{ID: id, Hostname: hostname, Rootfs: rootfs, Args: argv, Env: defaultEnv(hostname)}
 
@@ -166,7 +177,30 @@ func resolveImage(image string) (string, error) {
 	if !fi.IsDir() {
 		return "", fmt.Errorf("image %s is not a directory", dir)
 	}
+	if strings.ContainsAny(dir, ",:") {
+		return "", fmt.Errorf("image path %s can't contain ',' or ':', which separate overlayfs options", dir)
+	}
 	return dir, nil
+}
+
+// prepareRootfs creates the container's overlay directories. init mounts the
+// overlay itself, inside its own mount namespace, so the host never sees that
+// mount and the kernel removes it when the container's last process exits.
+func prepareRootfs(dir, image string) (spec.Rootfs, error) {
+	r := spec.Rootfs{
+		Image:  image,
+		Upper:  filepath.Join(dir, "upper"),
+		Work:   filepath.Join(dir, "work"),
+		Merged: filepath.Join(dir, "merged"),
+	}
+	// 0755 matters for upper: the root directory of the overlay takes its owner
+	// and mode from the upper layer.
+	for _, d := range []string{r.Upper, r.Work, r.Merged} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			return r, err
+		}
+	}
+	return r, nil
 }
 
 func newID() (string, error) {

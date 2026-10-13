@@ -123,11 +123,115 @@ func TestRootIsImage(t *testing.T) {
 	if got := mustRun(t, "alpine", "cat", "/etc/alpine-release"); got == "" {
 		t.Error("/etc/alpine-release is empty")
 	}
-	// Only the image itself and /proc: the host's mounts went away with the old root.
-	mounts := strings.Split(mustRun(t, "alpine", "cat", "/proc/mounts"), "\n")
-	if len(mounts) != 2 || !strings.HasPrefix(mounts[1], "proc /proc proc ") {
-		t.Errorf("container mounts:\n%s\nwant just / and /proc", strings.Join(mounts, "\n"))
+}
+
+// Exactly the overlay and the special filesystems: the host's mounts went away
+// with the old root.
+func TestMounts(t *testing.T) {
+	want := []string{
+		"/ overlay",
+		"/proc proc",
+		"/sys sysfs",
+		"/dev tmpfs",
+		"/dev/pts devpts",
+		"/dev/shm tmpfs",
+		"/dev/mqueue mqueue",
 	}
+	var got []string
+	for _, line := range strings.Split(mustRun(t, "alpine", "cat", "/proc/mounts"), "\n") {
+		f := strings.Fields(line) // source target fstype options ...
+		got = append(got, f[1]+" "+f[2])
+		if f[1] == "/sys" && !strings.HasPrefix(f[3], "ro,") {
+			t.Errorf("/sys is mounted %s, want read-only", f[3])
+		}
+	}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Errorf("container mounts:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+}
+
+// /dev holds the default devices and links and nothing from the host.
+func TestDev(t *testing.T) {
+	want := "fd full mqueue null ptmx pts random shm stderr stdin stdout tty urandom zero"
+	if got := strings.Join(strings.Fields(mustRun(t, "alpine", "ls", "/dev")), " "); got != want {
+		t.Errorf("ls /dev = %s\nwant      %s", got, want)
+	}
+	script := `for d in null zero full random urandom tty; do test -c /dev/$d || echo "/dev/$d is not a char device"; done
+		echo discarded > /dev/null
+		head -c 3 /dev/urandom | wc -c`
+	if got := mustRun(t, "alpine", "sh", "-c", script); got != "3" {
+		t.Errorf("got %q, want 3", got)
+	}
+}
+
+func TestEtcFiles(t *testing.T) {
+	if got := mustRun(t, "--hostname", "box2", "alpine", "cat", "/etc/hostname"); got != "box2" {
+		t.Errorf("/etc/hostname = %q, want box2", got)
+	}
+	if got := mustRun(t, "--hostname", "box2", "alpine", "grep", "box2", "/etc/hosts"); got != "127.0.1.1\tbox2" {
+		t.Errorf("/etc/hosts line = %q", got)
+	}
+	host, err := os.ReadFile("/etc/resolv.conf")
+	if err != nil {
+		t.Skip(err)
+	}
+	if got := mustRun(t, "alpine", "cat", "/etc/resolv.conf"); got != strings.TrimSpace(string(host)) {
+		t.Errorf("/etc/resolv.conf = %q, want the host's", got)
+	}
+}
+
+// A container's writes, deletes included, land in its own layer: the image and
+// the next container don't see them.
+func TestWritesStayInContainer(t *testing.T) {
+	image := filepath.Join(container.ImagesDir, "alpine")
+	if got := mustRun(t, "alpine", "sh", "-c", "echo hi > /etc/marker && rm /bin/ls && cat /etc/marker"); got != "hi" {
+		t.Fatalf("got %q, want hi", got)
+	}
+	if _, err := os.Lstat(filepath.Join(image, "etc", "marker")); err == nil {
+		t.Error("the write reached the image")
+	}
+	if _, err := os.Lstat(filepath.Join(image, "bin", "ls")); err != nil {
+		t.Errorf("the delete reached the image: %v", err)
+	}
+	if got := mustRun(t, "alpine", "sh", "-c", "test ! -e /etc/marker && test -e /bin/ls && echo clean"); got != "clean" {
+		t.Errorf("next container saw the changes: %q", got)
+	}
+}
+
+func TestParallelContainersHaveOwnLayers(t *testing.T) {
+	t.Run("group", func(t *testing.T) {
+		for _, v := range []string{"A", "B", "C"} {
+			t.Run(v, func(t *testing.T) {
+				t.Parallel()
+				if got := mustRun(t, "alpine", "sh", "-c", "echo "+v+" > /shared; sleep 0.3; cat /shared"); got != v {
+					t.Errorf("container %s read %q", v, got)
+				}
+			})
+		}
+	})
+}
+
+func TestContainerDirRemovedAfterExit(t *testing.T) {
+	before := containerDirs(t)
+	mustRun(t, "alpine", "sh", "-c", "echo data > /tmp/f")
+	for name := range containerDirs(t) {
+		if !before[name] {
+			t.Errorf("leftover container directory %s", name)
+		}
+	}
+}
+
+func containerDirs(t *testing.T) map[string]bool {
+	t.Helper()
+	entries, err := os.ReadDir(container.ContainersDir)
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	dirs := map[string]bool{}
+	for _, e := range entries {
+		dirs[e.Name()] = true
+	}
+	return dirs
 }
 
 func TestNoMountLeakToHost(t *testing.T) {
