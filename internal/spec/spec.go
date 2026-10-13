@@ -7,9 +7,18 @@ package spec
 type Config struct {
 	ID       string   `json:"id"`
 	Hostname string   `json:"hostname"`
-	Rootfs   string   `json:"rootfs"` // absolute path on the host
+	Rootfs   Rootfs   `json:"rootfs"`
 	Args     []string `json:"args"`
 	Env      []string `json:"env"`
+}
+
+// Rootfs is the container's root filesystem: an overlay of the read-only image
+// and a writable layer of its own. All paths are absolute host paths.
+type Rootfs struct {
+	Image  string `json:"image"`  // lowerdir, never written to
+	Upper  string `json:"upper"`  // the container's changes
+	Work   string `json:"work"`   // overlayfs scratch space, same filesystem as Upper
+	Merged string `json:"merged"` // where the overlay is mounted; becomes /
 }
 
 // InitPipeFD is the file descriptor init reads its Config from. It is the first

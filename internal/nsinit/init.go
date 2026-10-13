@@ -41,7 +41,7 @@ func run() error {
 	if err := syscall.Sethostname([]byte(cfg.Hostname)); err != nil {
 		return fmt.Errorf("sethostname: %w", err)
 	}
-	if err := setupRootfs(cfg.Rootfs); err != nil {
+	if err := setupRootfs(cfg); err != nil {
 		return err
 	}
 	return execCommand(cfg.Args, cfg.Env)
@@ -57,45 +57,6 @@ func readConfig() (*spec.Config, error) {
 		return nil, fmt.Errorf("read config: %w", err)
 	}
 	return &cfg, nil
-}
-
-// setupRootfs makes rootfs the container's / and mounts a fresh /proc.
-func setupRootfs(rootfs string) error {
-	// CLONE_NEWNS copied the host's mount table, propagation flags included. On a
-	// systemd host / is "shared", so mounts made here would show up on the host
-	// too. Make the whole tree private first.
-	if err := syscall.Mount("", "/", "", syscall.MS_REC|syscall.MS_PRIVATE, ""); err != nil {
-		return fmt.Errorf("make / private: %w", err)
-	}
-	// pivot_root requires new_root to be a mount point. Bind-mounting the
-	// directory onto itself makes it one.
-	if err := syscall.Mount(rootfs, rootfs, "", syscall.MS_BIND|syscall.MS_REC, ""); err != nil {
-		return fmt.Errorf("bind mount rootfs: %w", err)
-	}
-	if err := os.Chdir(rootfs); err != nil {
-		return err
-	}
-	// pivot_root(".", ".") is the trick from pivot_root(2): rootfs becomes / and
-	// the old root is stacked on top of it at the same place, so no temporary
-	// directory is needed inside the image. chroot would only change this
-	// process's view of /, and is escapable; pivot_root swaps the root of the
-	// whole mount namespace.
-	if err := syscall.PivotRoot(".", "."); err != nil {
-		return fmt.Errorf("pivot_root: %w", err)
-	}
-	// Detach the old root, with every host mount under it. MNT_DETACH because a
-	// plain unmount would fail with EBUSY on a tree full of submounts.
-	if err := syscall.Unmount(".", syscall.MNT_DETACH); err != nil {
-		return fmt.Errorf("unmount old root: %w", err)
-	}
-	if err := os.Chdir("/"); err != nil {
-		return err
-	}
-	// A proc mounted from inside the new PID namespace only lists its processes.
-	if err := syscall.Mount("proc", "/proc", "proc", syscall.MS_NOSUID|syscall.MS_NODEV|syscall.MS_NOEXEC, ""); err != nil {
-		return fmt.Errorf("mount /proc: %w", err)
-	}
-	return nil
 }
 
 // execCommand replaces init with the user's command, looked up in the

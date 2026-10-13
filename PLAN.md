@@ -11,14 +11,18 @@ exit codes.
 Done when: `microbox run alpine /bin/sh` shows its own hostname, and `ps` lists
 the shell as PID 1 and nothing from the host.
 
-## M2: filesystem
+## M2: filesystem (done)
 
-- An overlayfs per container: the image as lowerdir, upper and work under
-  `/var/lib/microbox/containers/<id>/`. M1 mounts the image directly, so
-  containers can change it.
-- `/dev` as tmpfs with null, zero, full, random, urandom and tty, plus devpts
-  for `/dev/pts` and `/dev/ptmx`, and `/dev/shm`.
-- `/sys` read-only, and `/etc/hostname` and `/etc/hosts`.
+- An overlayfs per container: the image as lowerdir, with upper and work under
+  `/var/lib/microbox/containers/<id>/`. init mounts it inside the container's
+  mount namespace, so no unmount is needed on the host. The directory is
+  removed on exit until M5 adds `rm`.
+- `/dev` as tmpfs with null, zero, full, random, urandom and tty, plus the
+  fd/stdin/stdout/stderr links, its own devpts with `/dev/ptmx`, `/dev/shm`
+  and `/dev/mqueue`.
+- `/sys` read-only. `/etc/hostname`, `/etc/hosts` and the host's
+  `/etc/resolv.conf` are written after the pivot, so image symlinks can't
+  redirect them to the host.
 
 Done when: a file written in one container doesn't appear in the image or in
 another container, and `ls > /dev/null` works.

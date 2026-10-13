@@ -3,9 +3,9 @@
 A small Linux container runtime in Go, built to learn what happens underneath
 Docker: namespaces, `pivot_root`, cgroups v2 and veth networking.
 
-Status: milestone 1 of [PLAN.md](PLAN.md) is done (process isolation and root
-filesystem). There are no resource limits yet, and containers share the host
-network.
+Status: milestones 1 and 2 of [PLAN.md](PLAN.md) are done (process isolation
+and the container filesystem). There are no resource limits yet, and
+containers share the host network.
 
 ## Try it
 
@@ -40,6 +40,8 @@ One binary, two processes.
 **microbox run** (host side, `internal/container`)
 
 1. Checks for root, resolves the image, makes a 12-hex-digit ID and opens a pipe.
+   Creates `/var/lib/microbox/containers/<id>/` with `upper`, `work` and
+   `merged`, and removes it when the container exits (like `docker run --rm`).
 2. Starts `/proc/self/exe init` with `CLONE_NEWUTS | CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWIPC`.
    Go is multithreaded, and a multithreaded process can't move itself into a
    new mount namespace, so microbox starts a fresh copy of itself inside the
@@ -52,11 +54,19 @@ One binary, two processes.
 
 1. Reads the config and sets the hostname.
 2. Marks `/` as recursively private, so its mounts don't show up on the host.
-3. Bind-mounts the rootfs onto itself (`pivot_root` needs a mount point), then
-   `pivot_root(".", ".")` and detaches the old root with all the host mounts
-   under it.
-4. Mounts a fresh `/proc`, which lists only this PID namespace.
-5. Execs the command, which takes over PID 1.
+3. Mounts an overlay on `merged`: the image is the read-only lower layer and
+   `upper` takes the container's writes, so the image never changes. The mount
+   exists only in the container's mount namespace, so the kernel removes it
+   when the container exits.
+4. `pivot_root(".", ".")` into `merged`, then detaches the old root with all
+   the host mounts under it.
+5. Mounts `/proc` (only this PID namespace), a read-only `/sys`, and a tmpfs
+   `/dev` with only null, zero, full, random, urandom and tty, plus its own
+   devpts, `/dev/shm` and `/dev/mqueue`.
+6. Writes `/etc/hostname`, `/etc/hosts` and a copy of the host's
+   `/etc/resolv.conf`. This happens after the pivot, so a symlink in the image
+   can't point the write at a host file.
+7. Execs the command, which takes over PID 1.
 
 Details worth knowing:
 
@@ -74,7 +84,7 @@ Details worth knowing:
 ```
 cmd/microbox/        CLI entry point, run + hidden init
 internal/container/  host side: image, clone flags, config pipe, signals, exit codes
-internal/nsinit/     container side: hostname, mounts, pivot_root, exec
+internal/nsinit/     container side: hostname, exec (init.go); overlay, pivot_root, /dev, /etc (rootfs.go)
 internal/spec/       config and exit codes shared by both sides
 e2e/                 tests that run the real binary
 scripts/get-alpine.sh
@@ -88,8 +98,15 @@ tests build the binary and run it against the alpine image. They check:
 - the hostname, and that the command is PID 1
 - `ps` sees only the container
 - the four namespace inodes differ from the host's
-- the container's only mounts are `/` and `/proc`, and the host mount table is unchanged
+- the exact list of container mounts (`/sys` read-only), and an unchanged host mount table
+- `/dev` holds exactly the default devices and links
+- `/etc/hostname`, `/etc/hosts` and `/etc/resolv.conf`
+- writes and deletes stay in the container: the image and the next container don't
+  see them, parallel containers don't see each other's, and the container
+  directory is gone afterwards
 - exit codes, and SIGKILL from inside vs from the host
+
+A unit test checks the device-number encoding against the host's own `/dev` nodes.
 
 Without root or the image, the tests skip.
 
