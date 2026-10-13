@@ -1,0 +1,89 @@
+# Plan
+
+Each milestone ends with e2e tests that prove the "done when" line.
+
+## M1: namespaces and root filesystem (done)
+
+UTS, PID, mount and IPC namespaces through the `/proc/self/exe init` re-exec,
+the config pipe on fd 3, `pivot_root(".", ".")`, `/proc`, signal handling and
+exit codes.
+
+Done when: `microbox run alpine /bin/sh` shows its own hostname, and `ps` lists
+the shell as PID 1 and nothing from the host.
+
+## M2: filesystem
+
+- An overlayfs per container: the image as lowerdir, upper and work under
+  `/var/lib/microbox/containers/<id>/`. M1 mounts the image directly, so
+  containers can change it.
+- `/dev` as tmpfs with null, zero, full, random, urandom and tty, plus devpts
+  for `/dev/pts` and `/dev/ptmx`, and `/dev/shm`.
+- `/sys` read-only, and `/etc/hostname` and `/etc/hosts`.
+
+Done when: a file written in one container doesn't appear in the image or in
+another container, and `ls > /dev/null` works.
+
+## M3: cgroups v2
+
+- `/sys/fs/cgroup/microbox/<id>`, with the parent `microbox/` cgroup kept empty
+  (the "no internal processes" rule).
+- Flags `--memory` (`memory.max` plus `memory.swap.max=0`), `--cpus` (`cpu.max`,
+  e.g. `"50000 100000"` for half a CPU) and `--pids` (`pids.max`).
+- Join the cgroup at clone time with `SysProcAttr.UseCgroupFD` and add
+  `CLONE_NEWCGROUP`.
+
+Done when: a memory hog is OOM-killed (`memory.events` counts it), a fork bomb
+is stopped, and `--cpus 0.5` shows up as about 50% CPU in `top`.
+
+## M4: networking
+
+- Bridge `mb0` at 10.88.0.1/16 and one veth pair per container. Move one end
+  into the child's network namespace between Start and the config write.
+- File-based IP assignment, a default route, `ip_forward`, iptables MASQUERADE,
+  `-p HOST:CONTAINER` with DNAT, and `/etc/resolv.conf`.
+- Netlink through vishvananda/netlink; configure the namespace with
+  `runtime.LockOSThread()`.
+
+Done when: two containers ping each other, reach the internet, and
+`-p 8080:80` serves from the host.
+
+## M5: lifecycle
+
+- `run -d`, `ps`, `stop`, `rm`, `exec`, `logs`.
+- State in `/var/lib/microbox/containers/<id>/state.json`, moving created →
+  running → stopped.
+- `stop` sends SIGTERM, waits, then writes `1` to `cgroup.kill`. `rm` is safe to
+  run twice. `gc` cleans up after crashes.
+- `exec` uses `setns` on `/proc/<pid>/ns/*`. Joining a mount namespace has to
+  happen before the Go runtime starts threads, so it needs a cgo constructor
+  (runc's `nsexec.c` approach).
+- `--init`: a small PID 1 that forwards signals and reaps zombies.
+
+Done when: a detached container survives the terminal closing, and after
+`stop` and `rm` no mount, cgroup, veth or iptables rule is left.
+
+## M6: security
+
+- Drop to Docker's default capability set, and set `no_new_privs`.
+- A seccomp deny-list.
+- Mask `/proc/kcore`, `/proc/sys` and similar. Mount with `nosuid,nodev`.
+- Optional user namespace (rootless).
+
+Done when: `mount`, `reboot` and loading kernel modules fail inside the container.
+
+## M7: images (stretch)
+
+Pull OCI images from Docker Hub and stack their layers as overlay lowerdirs.
+
+## Pitfalls
+
+- Forgetting `MS_PRIVATE` on `/` leaks the container's mounts to the host.
+- `pivot_root` returns EINVAL unless new_root is a mount point and the old root
+  isn't shared.
+- PID 1 ignores signals it has no handler for, and it has to reap zombies.
+- cgroup v2: you can't enable controllers in `subtree_control` on a cgroup that
+  has processes in it.
+- `setns` from Go needs a locked OS thread, and for the mount and user
+  namespaces it must happen before the runtime starts threads.
+- Cleanup has to be safe to repeat, because crashes leave veths, mounts and
+  cgroups behind.
