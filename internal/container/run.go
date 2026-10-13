@@ -177,8 +177,10 @@ func resolveImage(image string) (string, error) {
 	if !fi.IsDir() {
 		return "", fmt.Errorf("image %s is not a directory", dir)
 	}
-	if strings.ContainsAny(dir, ",:") {
-		return "", fmt.Errorf("image path %s can't contain ',' or ':', which separate overlayfs options", dir)
+	// overlayfs splits its options on ',' and lowerdir on ':', and reads '\'
+	// as an escape, so /tmp/a\b would be looked up as /tmp/ab.
+	if strings.ContainsAny(dir, `,:\`) {
+		return "", fmt.Errorf(`image path %s can't contain ',', ':' or '\', which have special meaning in overlayfs options`, dir)
 	}
 	return dir, nil
 }
