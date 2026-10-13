@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -35,15 +36,26 @@ type Cgroup struct {
 
 // Create makes the container's group and writes its limits.
 func Create(id string, l Limits) (*Cgroup, error) {
-	if err := setupParent(); err != nil {
+	return create(Root, id, l)
+}
+
+func create(root, id string, l Limits) (*Cgroup, error) {
+	enabled, err := setupParent(root)
+	if err != nil {
 		return nil, err
 	}
-	cg := &Cgroup{Path: filepath.Join(Parent, id)}
+	files := limitFiles(l)
+	for _, f := range files {
+		if controller, _, _ := strings.Cut(f.name, "."); !enabled[controller] {
+			return nil, fmt.Errorf("can't set %s: this host's cgroup v2 doesn't offer the %s controller", f.name, controller)
+		}
+	}
+	cg := &Cgroup{Path: filepath.Join(root, "microbox", id)}
 	if err := os.Mkdir(cg.Path, 0o755); err != nil {
 		return nil, err
 	}
-	for _, f := range limitFiles(l) {
-		err := os.WriteFile(filepath.Join(cg.Path, f.name), []byte(f.value), 0)
+	for _, f := range files {
+		err := os.WriteFile(filepath.Join(cg.Path, f.name), []byte(f.value), 0o644)
 		// memory.swap.max only exists when the kernel accounts swap, and then
 		// there is no swap to turn off.
 		if errors.Is(err, fs.ErrNotExist) && f.name == "memory.swap.max" {
@@ -57,24 +69,45 @@ func Create(id string, l Limits) (*Cgroup, error) {
 	return cg, nil
 }
 
-// setupParent creates Parent and enables the controllers for its children. A
-// controller is only available in a group if every ancestor lists it in
-// cgroup.subtree_control. Parent never holds processes itself: cgroup v2's
+// wanted are the controllers the limits use.
+var wanted = []string{"cpu", "memory", "pids"}
+
+// setupParent creates root/microbox and enables controllers for its children.
+// A controller is only available in a group if every ancestor lists it in
+// cgroup.subtree_control. The parent never holds processes itself: cgroup v2's
 // "no internal processes" rule forbids handing controllers down from a group
 // that has processes of its own.
-func setupParent() error {
-	if _, err := os.Stat(filepath.Join(Root, "cgroup.controllers")); err != nil {
-		return fmt.Errorf("cgroup v2 is not mounted at %s: %w", Root, err)
+//
+// Only the wanted controllers that root offers are enabled. A host can keep
+// some controllers on cgroup v1 or disable them, and a subtree_control write
+// naming any unavailable controller fails as a whole. It returns the enabled
+// set, so only a limit that needs a missing controller fails.
+func setupParent(root string) (map[string]bool, error) {
+	offered, err := os.ReadFile(filepath.Join(root, "cgroup.controllers"))
+	if err != nil {
+		return nil, fmt.Errorf("cgroup v2 is not mounted at %s: %w", root, err)
 	}
-	if err := os.MkdirAll(Parent, 0o755); err != nil {
-		return err
-	}
-	for _, dir := range []string{Root, Parent} {
-		if err := os.WriteFile(filepath.Join(dir, "cgroup.subtree_control"), []byte("+cpu +memory +pids"), 0); err != nil {
-			return fmt.Errorf("enable controllers in %s: %w", dir, err)
+	enabled := map[string]bool{}
+	var enable []string
+	for _, c := range wanted {
+		if slices.Contains(strings.Fields(string(offered)), c) {
+			enabled[c] = true
+			enable = append(enable, "+"+c)
 		}
 	}
-	return nil
+	parent := filepath.Join(root, "microbox")
+	if err := os.MkdirAll(parent, 0o755); err != nil {
+		return nil, err
+	}
+	if len(enable) == 0 {
+		return enabled, nil
+	}
+	for _, dir := range []string{root, parent} {
+		if err := os.WriteFile(filepath.Join(dir, "cgroup.subtree_control"), []byte(strings.Join(enable, " ")), 0o644); err != nil {
+			return nil, fmt.Errorf("enable controllers in %s: %w", dir, err)
+		}
+	}
+	return enabled, nil
 }
 
 type limitFile struct{ name, value string }
