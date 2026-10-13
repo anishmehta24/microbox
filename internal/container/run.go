@@ -18,11 +18,13 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/anishmehta24/microbox/internal/cgroups"
+	"github.com/anishmehta24/microbox/internal/image"
 	"github.com/anishmehta24/microbox/internal/network"
 	"github.com/anishmehta24/microbox/internal/nsinit"
 	"github.com/anishmehta24/microbox/internal/spec"
@@ -45,12 +47,13 @@ const cloneFlags = syscall.CLONE_NEWUTS | // own hostname
 	syscall.CLONE_NEWIPC | // own System V IPC and POSIX message queues
 	syscall.CLONE_NEWCGROUP // /proc/self/cgroup and /sys/fs/cgroup start at the container's group
 
-const runUsage = "usage: microbox run [-d] [--rm] [--init] [--hostname NAME] [--memory SIZE] [--cpus N] [--pids N] [--net MODE] [-p HOST:CONTAINER]... IMAGE COMMAND [ARG...]"
+const runUsage = "usage: microbox run [-d] [--rm] [--init] [--user USER] [--hostname NAME] [--memory SIZE] [--cpus N] [--pids N] [--net MODE] [-p HOST:CONTAINER]... IMAGE [COMMAND [ARG...]]"
 
 type options struct {
 	hostname   string
+	user       string
 	image      string
-	argv       []string
+	argv       []string // empty: the image's command
 	limits     cgroups.Limits
 	net        network.Mode
 	ports      portsFlag
@@ -80,6 +83,9 @@ func Run(args []string) int {
 	fl.BoolVar(&opts.autoRemove, "rm", false, "remove the container when it exits")
 	fl.BoolVar(&opts.init, "init", false, "run an init as PID 1 that forwards signals and reaps zombies")
 	fl.StringVar(&opts.hostname, "hostname", "", "container hostname (default: the container ID)")
+	for _, name := range []string{"user", "u"} {
+		fl.StringVar(&opts.user, name, "", "run as USER, UID, USER:GROUP or UID:GID (default: the image's user, or root)")
+	}
 	memory := fl.String("memory", "", "memory limit, e.g. 256m or 1g (no swap on top)")
 	fl.Float64Var(&opts.limits.CPUs, "cpus", 0, "CPU limit in CPUs, e.g. 0.5")
 	fl.Int64Var(&opts.limits.Pids, "pids", 0, "maximum number of processes")
@@ -88,7 +94,7 @@ func Run(args []string) int {
 	if err := fl.Parse(args); err != nil {
 		return 2
 	}
-	if fl.NArg() < 2 {
+	if fl.NArg() < 1 {
 		fmt.Fprintln(os.Stderr, runUsage)
 		return 2
 	}
@@ -136,9 +142,22 @@ func create(opts options) (*Container, error) {
 			return nil, err
 		}
 	}
-	imageDir, err := resolveImage(opts.image)
+	img, err := resolveImage(opts.image)
 	if err != nil {
 		return nil, err
+	}
+	// As in docker: the image's entrypoint, then the command given or else
+	// the image's command.
+	args := append(slices.Clone(img.config.Entrypoint), opts.argv...)
+	if len(opts.argv) == 0 {
+		args = append(args, img.config.Cmd...)
+	}
+	if len(args) == 0 {
+		return nil, fmt.Errorf("no command given, and image %s has none", opts.image)
+	}
+	user := opts.user
+	if user == "" {
+		user = img.config.User
 	}
 	id, err := newID()
 	if err != nil {
@@ -165,8 +184,13 @@ func create(opts options) (*Container, error) {
 		Config: spec.Config{
 			ID:       id,
 			Hostname: hostname,
-			Process:  spec.Process{Args: opts.argv, Env: defaultEnv(hostname)},
-			Init:     opts.init,
+			Process: spec.Process{
+				Args: args,
+				Env:  containerEnv(img.config.Env, hostname),
+				Cwd:  img.config.WorkingDir,
+				User: user,
+			},
+			Init: opts.init,
 		},
 		Limits:     opts.limits,
 		Net:        opts.net,
@@ -176,7 +200,7 @@ func create(opts options) (*Container, error) {
 		Status:     Created,
 		Supervisor: self,
 	}
-	c.Config.Rootfs, err = prepareRootfs(containerDir(id), imageDir)
+	c.Config.Rootfs, err = prepareRootfs(containerDir(id), img.lower)
 	if err == nil {
 		err = c.save()
 	}
@@ -485,23 +509,48 @@ func exitCode(ps *os.ProcessState) int {
 	return ps.ExitCode()
 }
 
-// resolveImage maps a bare name like "alpine" to ImagesDir/alpine; anything with
-// a slash is used as a path.
-func resolveImage(image string) (string, error) {
-	dir := image
-	if !strings.Contains(image, "/") {
-		dir = filepath.Join(ImagesDir, image)
+// resolvedImage is what a container is built from: its layer directories, top
+// first, and how to run it.
+type resolvedImage struct {
+	lower  []string
+	config image.Config
+}
+
+// resolveImage finds the image a name refers to. It is, in this order:
+//   - a path to a root filesystem, if it starts with / or .
+//   - an image pulled with microbox pull, such as alpine:3.20
+//   - a root filesystem under ImagesDir, such as the one get-alpine.sh unpacks
+func resolveImage(name string) (resolvedImage, error) {
+	if strings.HasPrefix(name, "/") || strings.HasPrefix(name, ".") {
+		dir, err := rootfsDir(name)
+		return resolvedImage{lower: []string{dir}}, err
 	}
-	dir, err := filepath.Abs(dir)
+	if _, err := image.ParseReference(name); err == nil {
+		img, err := image.Lookup(name)
+		if err == nil {
+			return resolvedImage{img.LowerDirs(), img.Config}, nil
+		}
+		if !errors.Is(err, fs.ErrNotExist) {
+			return resolvedImage{}, err
+		}
+	}
+	dir := filepath.Join(ImagesDir, name)
+	if _, err := os.Stat(dir); err != nil {
+		return resolvedImage{}, fmt.Errorf("image %q not found: pull it with microbox pull, or unpack a root filesystem at %s (scripts/get-alpine.sh does that for alpine)", name, dir)
+	}
+	dir, err := rootfsDir(dir)
+	return resolvedImage{lower: []string{dir}}, err
+}
+
+// rootfsDir checks a directory used as a whole root filesystem.
+func rootfsDir(path string) (string, error) {
+	dir, err := filepath.Abs(path)
 	if err != nil {
 		return "", err
 	}
 	fi, err := os.Stat(dir)
-	if errors.Is(err, fs.ErrNotExist) {
-		return "", fmt.Errorf("image %q not found at %s (try: sudo scripts/get-alpine.sh)", image, dir)
-	}
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("image: %w", err)
 	}
 	if !fi.IsDir() {
 		return "", fmt.Errorf("image %s is not a directory", dir)
@@ -517,12 +566,17 @@ func resolveImage(image string) (string, error) {
 // prepareRootfs creates the container's overlay directories. init mounts the
 // overlay itself, inside its own mount namespace, so the host never sees that
 // mount and the kernel removes it when the container's last process exits.
-func prepareRootfs(dir, image string) (spec.Rootfs, error) {
+func prepareRootfs(dir string, lower []string) (spec.Rootfs, error) {
 	r := spec.Rootfs{
-		Image:  image,
+		Lower:  lower,
 		Upper:  filepath.Join(dir, "upper"),
 		Work:   filepath.Join(dir, "work"),
 		Merged: filepath.Join(dir, "merged"),
+	}
+	// The kernel copies mount options into one page, so that is as many
+	// layers as one overlay mount can stack: about 40 with these paths.
+	if n := len("lowerdir=,upperdir=,workdir=") + len(strings.Join(r.Lower, ":")) + len(r.Upper) + len(r.Work); n >= os.Getpagesize() {
+		return r, fmt.Errorf("the image has %d layers, more than one overlay mount can take", len(r.Lower))
 	}
 	// 0755 matters for upper: the root directory of the overlay takes its owner
 	// and mode from the upper layer.
@@ -554,14 +608,28 @@ func hostsFile(hostname string, ip net.IP) string {
 		self + "\t" + hostname + "\n"
 }
 
-func defaultEnv(hostname string) []string {
-	env := []string{
-		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-		"HOME=/root",
-		"HOSTNAME=" + hostname,
-	}
+// containerEnv is the image's environment plus what docker adds: a PATH if
+// the image sets none, HOSTNAME, and the caller's TERM. init adds HOME, from
+// the user's entry in the image's /etc/passwd.
+func containerEnv(imageEnv []string, hostname string) []string {
+	env := setEnv([]string{"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"}, imageEnv...)
+	env = setEnv(env, "HOSTNAME="+hostname)
 	if term := os.Getenv("TERM"); term != "" {
-		env = append(env, "TERM="+term)
+		env = setEnv(env, "TERM="+term)
+	}
+	return env
+}
+
+// setEnv sets each KEY=VALUE in env, replacing an earlier value for KEY.
+func setEnv(env []string, kvs ...string) []string {
+	for _, kv := range kvs {
+		key, _, _ := strings.Cut(kv, "=")
+		i := slices.IndexFunc(env, func(e string) bool { return strings.HasPrefix(e, key+"=") })
+		if i >= 0 {
+			env[i] = kv
+		} else {
+			env = append(env, kv)
+		}
 	}
 	return env
 }

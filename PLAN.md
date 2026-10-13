@@ -121,9 +121,26 @@ Not covered:
 - A seccomp filter for other architectures: microbox refuses to start
   containers there.
 
-## M7: images (stretch)
+## M7: images (done)
 
-Pull OCI images from Docker Hub and stack their layers as overlay lowerdirs.
+- `pull`, `images`, `rmi`, with layers cleaned up by `gc`.
+- A registry client for the distribution API: anonymous Bearer tokens, OCI
+  and Docker manifests and indexes (linux on the host's architecture),
+  digest and size checks on everything, HEAD to skip unchanged images.
+  Plain HTTP for registries on localhost.
+- Layers unpacked once each, through `os.Root` so no entry can land outside
+  its directory, with whiteouts and opaque directories turned into
+  overlayfs's own form. They stack as lowerdirs.
+- The image config gives the command (entrypoint + cmd), environment,
+  working directory and user. `--user` overrides the user, which init
+  looks up in the image's `/etc/passwd` and `/etc/group`.
+
+Done when: an image from Docker Hub runs. `nginx:alpine` (8 layers) serves
+its welcome page on a published port.
+
+Not covered: zstd layers, credentials for private registries, pulling by
+digest, pushing, building images, and xattrs from layers other than the
+opaque marker.
 
 ## Pitfalls
 

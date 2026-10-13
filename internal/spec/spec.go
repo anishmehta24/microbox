@@ -25,15 +25,17 @@ type Config struct {
 type Process struct {
 	Args []string `json:"args"`
 	Env  []string `json:"env"`
+	Cwd  string   `json:"cwd,omitempty"`  // inside the container; / if empty
+	User string   `json:"user,omitempty"` // USER, UID, USER:GROUP or UID:GID; root if empty
 }
 
 // Rootfs is the container's root filesystem: an overlay of the read-only image
-// and a writable layer of its own. All paths are absolute host paths.
+// layers and a writable layer of its own. All paths are absolute host paths.
 type Rootfs struct {
-	Image  string `json:"image"`  // lowerdir, never written to
-	Upper  string `json:"upper"`  // the container's changes
-	Work   string `json:"work"`   // overlayfs scratch space, same filesystem as Upper
-	Merged string `json:"merged"` // where the overlay is mounted; becomes /
+	Lower  []string `json:"lower"`  // the image's layers, top first, never written to
+	Upper  string   `json:"upper"`  // the container's changes
+	Work   string   `json:"work"`   // overlayfs scratch space, same filesystem as Upper
+	Merged string   `json:"merged"` // where the overlay is mounted; becomes /
 }
 
 // File descriptors the runtime passes to init and exec-init, as entries of

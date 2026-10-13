@@ -122,7 +122,9 @@ func execIn(ref string, argv []string) (int, error) {
 	}
 	go forwardSignals(sigs, cmd.Process)
 
-	p := spec.Process{Args: argv, Env: execEnv(c.Config.Process.Env)}
+	// The container's environment, working directory and user, as docker exec.
+	p := c.Config.Process
+	p.Args, p.Env = argv, execEnv(p.Env)
 	if err := json.NewEncoder(pw).Encode(p); err != nil {
 		cmd.Process.Kill()
 		cmd.Wait()
