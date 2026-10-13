@@ -27,14 +27,16 @@ the shell as PID 1 and nothing from the host.
 Done when: a file written in one container doesn't appear in the image or in
 another container, and `ls > /dev/null` works.
 
-## M3: cgroups v2
+## M3: cgroups v2 (done)
 
 - `/sys/fs/cgroup/microbox/<id>`, with the parent `microbox/` cgroup kept empty
   (the "no internal processes" rule).
 - Flags `--memory` (`memory.max` plus `memory.swap.max=0`), `--cpus` (`cpu.max`,
   e.g. `"50000 100000"` for half a CPU) and `--pids` (`pids.max`).
 - Join the cgroup at clone time with `SysProcAttr.UseCgroupFD` and add
-  `CLONE_NEWCGROUP`.
+  `CLONE_NEWCGROUP`. Inside, `/sys/fs/cgroup` is a read-only cgroup2 mount
+  rooted at the container's group.
+- After exit, report OOM kills from `memory.events` and remove the group.
 
 Done when: a memory hog is OOM-killed (`memory.events` counts it), a fork bomb
 is stopped, and `--cpus 0.5` shows up as about 50% CPU in `top`.

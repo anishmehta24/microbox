@@ -3,9 +3,9 @@
 A small Linux container runtime in Go, built to learn what happens underneath
 Docker: namespaces, `pivot_root`, cgroups v2 and veth networking.
 
-Status: milestones 1 and 2 of [PLAN.md](PLAN.md) are done (process isolation
-and the container filesystem). There are no resource limits yet, and
-containers share the host network.
+Status: milestones 1–3 of [PLAN.md](PLAN.md) are done (process isolation, the
+container filesystem and resource limits). Containers still share the host
+network.
 
 ## Try it
 
@@ -26,8 +26,22 @@ PID   COMMAND
     7 ps
 ```
 
-`--hostname NAME` sets the hostname; the default is the container ID. IMAGE is
-a name under `/var/lib/microbox/images` or a path to any root filesystem.
+IMAGE is a name under `/var/lib/microbox/images` or a path to any root
+filesystem. Options:
+
+| Flag | Effect |
+|---|---|
+| `--hostname NAME` | hostname (default: the container ID) |
+| `--memory 256m` | `memory.max`, with `memory.swap.max=0` so the limit can't be dodged by swapping |
+| `--cpus 0.5` | `cpu.max` = `50000 100000`: 50 ms of CPU time per 100 ms |
+| `--pids 64` | `pids.max`: forks beyond it fail |
+
+```
+$ sudo bin/microbox run --memory 32m alpine sh -c 'x=$(head -c 100m /dev/zero | tr "\0" a)'
+microbox: container reached its memory limit; the OOM killer killed 1 process(es)
+$ echo $?
+137
+```
 
 Exit codes are the command's own, or 125 for a runtime error, 126 when the
 command can't be executed, 127 when it isn't found, and 128+N when the
@@ -42,13 +56,20 @@ One binary, two processes.
 1. Checks for root, resolves the image, makes a 12-hex-digit ID and opens a pipe.
    Creates `/var/lib/microbox/containers/<id>/` with `upper`, `work` and
    `merged`, and removes it when the container exits (like `docker run --rm`).
-2. Starts `/proc/self/exe init` with `CLONE_NEWUTS | CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWIPC`.
-   Go is multithreaded, and a multithreaded process can't move itself into a
-   new mount namespace, so microbox starts a fresh copy of itself inside the
-   new namespaces instead.
-3. Writes the config as JSON into the pipe (fd 3 in the child). The child waits
-   for it, so later milestones can set up the cgroup and network first.
-4. Waits, then exits with the container's exit code.
+2. Creates the cgroup `/sys/fs/cgroup/microbox/<id>` and writes the limits.
+   The parent `microbox` group never holds processes, because cgroup v2 only
+   hands controllers down from groups that have none.
+3. Starts `/proc/self/exe init` with `CLONE_NEWUTS | CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWIPC | CLONE_NEWCGROUP`.
+   - Go is multithreaded, and a multithreaded process can't move itself into
+     a new mount namespace, so microbox starts a fresh copy of itself inside
+     the new namespaces instead.
+   - The start uses clone3 with `CLONE_INTO_CGROUP` (Go's `UseCgroupFD`), so
+     the child is born inside its cgroup, and its cgroup namespace starts at
+     that group.
+4. Writes the config as JSON into the pipe (fd 3 in the child). The child waits
+   for it, so M4 can set up the network first.
+5. Waits, reports any OOM kills from `memory.events`, removes the cgroup and
+   exits with the container's exit code.
 
 **microbox init** (container side, `internal/nsinit`), PID 1 in the new namespace
 
@@ -60,7 +81,8 @@ One binary, two processes.
    when the container exits.
 4. `pivot_root(".", ".")` into `merged`, then detaches the old root with all
    the host mounts under it.
-5. Mounts `/proc` (only this PID namespace), a read-only `/sys`, and a tmpfs
+5. Mounts `/proc` (only this PID namespace), a read-only `/sys`, a read-only
+   `/sys/fs/cgroup` showing only the container's own group, and a tmpfs
    `/dev` with only null, zero, full, random, urandom and tty, plus its own
    devpts, `/dev/shm` and `/dev/mqueue`.
 6. Writes `/etc/hostname`, `/etc/hosts` and a copy of the host's
@@ -83,7 +105,8 @@ Details worth knowing:
 
 ```
 cmd/microbox/        CLI entry point, run + hidden init
-internal/container/  host side: image, clone flags, config pipe, signals, exit codes
+internal/container/  host side: flags, image, clone flags, config pipe, signals, exit codes
+internal/cgroups/    cgroup v2 group per container: limits, OOM count, removal
 internal/nsinit/     container side: hostname, exec (init.go); overlay, pivot_root, /dev, /etc (rootfs.go)
 internal/spec/       config and exit codes shared by both sides
 e2e/                 tests that run the real binary
@@ -105,8 +128,14 @@ tests build the binary and run it against the alpine image. They check:
   see them, parallel containers don't see each other's, and the container
   directory is gone afterwards
 - exit codes, and SIGKILL from inside vs from the host
+- `/proc/self/cgroup` is `0::/`, and the limits (or `max`) are readable inside
+- a 100 MB shell variable under `--memory 32m` is OOM-killed with exit 137
+- `--pids 8` peaks at 8 processes and counts the refused forks
+- a one-second busy loop under `--cpus 0.2` is throttled to well under 400 ms of CPU
+- bad flag values exit 2, and no cgroup is left behind
 
-A unit test checks the device-number encoding against the host's own `/dev` nodes.
+Unit tests cover size parsing, the limit files (including `cpu.max` rounding),
+and the device-number encoding against the host's own `/dev` nodes.
 
 Without root or the image, the tests skip.
 

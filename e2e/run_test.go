@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/anishmehta24/microbox/internal/cgroups"
 	"github.com/anishmehta24/microbox/internal/container"
 )
 
@@ -132,6 +133,7 @@ func TestMounts(t *testing.T) {
 		"/ overlay",
 		"/proc proc",
 		"/sys sysfs",
+		"/sys/fs/cgroup cgroup2",
 		"/dev tmpfs",
 		"/dev/pts devpts",
 		"/dev/shm tmpfs",
@@ -141,8 +143,8 @@ func TestMounts(t *testing.T) {
 	for _, line := range strings.Split(mustRun(t, "alpine", "cat", "/proc/mounts"), "\n") {
 		f := strings.Fields(line) // source target fstype options ...
 		got = append(got, f[1]+" "+f[2])
-		if f[1] == "/sys" && !strings.HasPrefix(f[3], "ro,") {
-			t.Errorf("/sys is mounted %s, want read-only", f[3])
+		if (f[1] == "/sys" || f[1] == "/sys/fs/cgroup") && !strings.HasPrefix(f[3], "ro,") {
+			t.Errorf("%s is mounted %s, want read-only", f[1], f[3])
 		}
 	}
 	if strings.Join(got, "\n") != strings.Join(want, "\n") {
@@ -314,4 +316,100 @@ func countLines(t *testing.T, path string) int {
 		t.Fatal(err)
 	}
 	return bytes.Count(b, []byte("\n"))
+}
+
+// The cgroup namespace starts at the container's own group.
+func TestCgroupNamespace(t *testing.T) {
+	if got := mustRun(t, "alpine", "cat", "/proc/self/cgroup"); got != "0::/" {
+		t.Errorf("/proc/self/cgroup = %q, want 0::/", got)
+	}
+}
+
+func TestLimitsVisibleInside(t *testing.T) {
+	read := "cat /sys/fs/cgroup/memory.max /sys/fs/cgroup/memory.swap.max /sys/fs/cgroup/cpu.max /sys/fs/cgroup/pids.max"
+	got := mustRun(t, "--memory", "64m", "--cpus", "0.5", "--pids", "32", "alpine", "sh", "-c", read)
+	if want := "67108864\n0\n50000 100000\n32"; got != want {
+		t.Errorf("limits inside:\n%s\nwant:\n%s", got, want)
+	}
+	got = mustRun(t, "alpine", "cat", "/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/cpu.max", "/sys/fs/cgroup/pids.max")
+	if want := "max\nmax 100000\nmax"; got != want {
+		t.Errorf("default limits:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+// The shell holds 100 MB in a variable, which a 32 MB container can't. The
+// tr keeps the bytes non-zero, since the shell would drop NUL bytes.
+func TestMemoryLimitOOMKills(t *testing.T) {
+	out, code := microbox(t, "--memory", "32m", "alpine", "sh", "-c", `x=$(head -c 100m /dev/zero | tr '\0' a); echo survived`)
+	if code != 128+9 || !strings.Contains(out, "OOM killer killed") || strings.Contains(out, "survived") {
+		t.Errorf("exit %d, output:\n%s\nwant an OOM kill (exit 137)", code, out)
+	}
+}
+
+// Forking in a subshell: when fork fails the subshell aborts, but PID 1 lives
+// on to read the counters with shell builtins, which don't need a fork.
+func TestPidsLimit(t *testing.T) {
+	script := `(for i in $(seq 20); do sleep 2 & done) 2>/dev/null
+		read peak < /sys/fs/cgroup/pids.peak
+		read ev < /sys/fs/cgroup/pids.events
+		echo "$peak $ev"`
+	f := strings.Fields(mustRun(t, "--pids", "8", "alpine", "sh", "-c", script)) // "8 max N"
+	if len(f) != 3 || f[0] != "8" || f[1] != "max" || f[2] == "0" {
+		t.Errorf("got %v, want a peak of 8 processes and failed forks counted", f)
+	}
+}
+
+// A busy loop for one second at 0.2 CPUs gets throttled to about 200 ms of CPU.
+func TestCPULimit(t *testing.T) {
+	out := mustRun(t, "--cpus", "0.2", "alpine", "sh", "-c", `timeout 1 sh -c 'while :; do :; done'; cat /sys/fs/cgroup/cpu.stat`)
+	stat := map[string]int64{}
+	for _, line := range strings.Split(out, "\n") {
+		if k, v, ok := strings.Cut(line, " "); ok {
+			stat[k], _ = strconv.ParseInt(v, 10, 64)
+		}
+	}
+	if stat["nr_throttled"] == 0 || stat["usage_usec"] > 400000 {
+		t.Errorf("usage_usec=%d nr_throttled=%d, want throttling well under 1 s of CPU\n%s", stat["usage_usec"], stat["nr_throttled"], out)
+	}
+}
+
+func TestBadLimitFlags(t *testing.T) {
+	for _, args := range [][]string{
+		{"--memory", "10x", "alpine", "true"},
+		{"--cpus", "0.001", "alpine", "true"},
+		{"--cpus", "NaN", "alpine", "true"},
+		{"--cpus", "+Inf", "alpine", "true"},
+		{"--cpus", "100000", "alpine", "true"},
+		{"--cpus", "-1", "alpine", "true"},
+		{"--pids", "-1", "alpine", "true"},
+	} {
+		if out, code := microbox(t, args...); code != 2 {
+			t.Errorf("microbox run %s: exit %d, want 2\n%s", strings.Join(args, " "), code, out)
+		}
+	}
+}
+
+func TestCgroupRemovedAfterExit(t *testing.T) {
+	before := cgroupDirs(t)
+	mustRun(t, "--memory", "64m", "alpine", "true")
+	for name := range cgroupDirs(t) {
+		if !before[name] {
+			t.Errorf("leftover cgroup %s", name)
+		}
+	}
+}
+
+func cgroupDirs(t *testing.T) map[string]bool {
+	t.Helper()
+	entries, err := os.ReadDir(cgroups.Parent)
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	dirs := map[string]bool{}
+	for _, e := range entries {
+		if e.IsDir() {
+			dirs[e.Name()] = true
+		}
+	}
+	return dirs
 }
