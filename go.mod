@@ -1,6 +1,6 @@
 module github.com/anishmehta24/microbox
 
-go 1.22
+go 1.25
 
 require (
 	github.com/vishvananda/netlink v1.3.1

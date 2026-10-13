@@ -214,6 +214,7 @@ func Logs(args []string) int {
 //   - dead containers, after releasing what they held
 //   - cgroups and network resources whose container no longer exists
 //   - container directories whose removal was interrupted
+//   - image layers that no image or container uses, such as after rmi
 func GC(args []string) int {
 	if len(args) > 0 {
 		return usage("usage: microbox gc")
@@ -272,6 +273,7 @@ func GC(args []string) int {
 	for _, dir := range trash {
 		errs = append(errs, os.RemoveAll(dir))
 	}
+	errs = append(errs, removeUnusedLayers())
 	if err := errors.Join(errs...); err != nil {
 		return fail(err)
 	}

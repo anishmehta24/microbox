@@ -82,6 +82,9 @@ func execMain() error {
 	if err := restrict(); err != nil {
 		return err
 	}
+	if err := enter(&p); err != nil {
+		return err
+	}
 	return execCommand(p)
 }
 
@@ -111,6 +114,10 @@ func run() error {
 		return err
 	}
 	if err := restrict(); err != nil {
+		return err
+	}
+	// With --init the reaper runs as the command's user too, as tini does.
+	if err := enter(&cfg.Process); err != nil {
 		return err
 	}
 	if cfg.Init {

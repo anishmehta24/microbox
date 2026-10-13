@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"strings"
 	"syscall"
 
 	"github.com/anishmehta24/microbox/internal/spec"
@@ -37,11 +38,12 @@ func setupRootfs(cfg *spec.Config) error {
 	return writeEtcFiles(cfg)
 }
 
-// mountOverlay stacks the container's writable layer on the read-only image.
-// Reads fall through to the image; the first write to a file copies it up into
-// upper, so the image never changes and every container has its own layer.
+// mountOverlay stacks the container's writable layer on the read-only image
+// layers. Reads fall through to the highest layer that has the file; the
+// first write to a file copies it up into upper, so the image never changes
+// and every container has its own layer.
 func mountOverlay(r spec.Rootfs) error {
-	opts := fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s", r.Image, r.Upper, r.Work)
+	opts := fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s", strings.Join(r.Lower, ":"), r.Upper, r.Work)
 	if err := syscall.Mount("overlay", r.Merged, "overlay", 0, opts); err != nil {
 		return fmt.Errorf("mount overlay: %w", err)
 	}
