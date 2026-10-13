@@ -10,6 +10,11 @@ type Config struct {
 	Rootfs   Rootfs   `json:"rootfs"`
 	Args     []string `json:"args"`
 	Env      []string `json:"env"`
+
+	// Contents of /etc/hosts and /etc/resolv.conf. They depend on the
+	// network, which the runtime sets up, so the runtime writes them.
+	Hosts      string `json:"hosts"`
+	ResolvConf string `json:"resolvConf"`
 }
 
 // Rootfs is the container's root filesystem: an overlay of the read-only image

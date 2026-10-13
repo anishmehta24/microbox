@@ -19,6 +19,9 @@ Options:
   --memory SIZE     memory limit, e.g. 256m or 1g; no swap on top
   --cpus N          CPU limit, e.g. 0.5 for half of one CPU
   --pids N          maximum number of processes
+  --net MODE        bridge (default): own IP on mb0 with NAT; none: loopback only;
+                    host: share the host's network
+  -p HOST:CONTAINER publish a container TCP port on the host (repeatable)
 `
 
 func main() {

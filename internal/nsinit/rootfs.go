@@ -22,12 +22,6 @@ func setupRootfs(cfg *spec.Config) error {
 	if err := mountOverlay(cfg.Rootfs); err != nil {
 		return err
 	}
-	// Read while the host's /etc is still reachable. The container shares the
-	// host network until M4, so the host's DNS servers work inside it too.
-	resolvConf, err := os.ReadFile("/etc/resolv.conf")
-	if err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return err
-	}
 	if err := pivotRoot(cfg.Rootfs.Merged); err != nil {
 		return err
 	}
@@ -37,7 +31,7 @@ func setupRootfs(cfg *spec.Config) error {
 	if err := createDevices(); err != nil {
 		return err
 	}
-	return writeEtcFiles(cfg.Hostname, resolvConf)
+	return writeEtcFiles(cfg)
 }
 
 // mountOverlay stacks the container's writable layer on the read-only image.
@@ -156,21 +150,18 @@ func mkdev(major, minor uint32) int {
 	return int(uint64(minor&0xff) | uint64(major&0xfff)<<8 | uint64(minor&^0xff)<<12 | uint64(major&^0xfff)<<32)
 }
 
-// writeEtcFiles gives the container its own /etc/hostname and /etc/hosts and a
-// copy of the host's /etc/resolv.conf. They are written after pivot_root, so
-// even a symlinked /etc in the image resolves inside the container and can't
-// make microbox write to a host file. Existing files are removed first, so a
-// symlink gets replaced instead of followed. The writes go through the
-// overlay into the container's upper layer.
-func writeEtcFiles(hostname string, resolvConf []byte) error {
-	files := map[string][]byte{
-		"/etc/hostname": []byte(hostname + "\n"),
-		"/etc/hosts": []byte("127.0.0.1\tlocalhost\n" +
-			"::1\tlocalhost ip6-localhost ip6-loopback\n" +
-			"127.0.1.1\t" + hostname + "\n"),
+// writeEtcFiles writes /etc/hostname, /etc/hosts and /etc/resolv.conf. They
+// are written after pivot_root, so even a symlinked /etc in the image resolves
+// inside the container and can't make microbox write to a host file. Existing
+// files are removed first, so a symlink gets replaced instead of followed. The
+// writes go through the overlay into the container's upper layer.
+func writeEtcFiles(cfg *spec.Config) error {
+	files := map[string]string{
+		"/etc/hostname": cfg.Hostname + "\n",
+		"/etc/hosts":    cfg.Hosts,
 	}
-	if resolvConf != nil {
-		files["/etc/resolv.conf"] = resolvConf
+	if cfg.ResolvConf != "" {
+		files["/etc/resolv.conf"] = cfg.ResolvConf
 	}
 	if err := os.MkdirAll("/etc", 0o755); err != nil {
 		return err
@@ -179,7 +170,7 @@ func writeEtcFiles(hostname string, resolvConf []byte) error {
 		if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return err
 		}
-		if err := os.WriteFile(path, data, 0o644); err != nil {
+		if err := os.WriteFile(path, []byte(data), 0o644); err != nil {
 			return err
 		}
 	}
