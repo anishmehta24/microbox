@@ -86,6 +86,11 @@ func execIn(ref string, argv []string) (int, error) {
 		return 0, err
 	}
 	defer pw.Close()
+	exe, err := sealedCopy()
+	if err != nil {
+		return 0, err
+	}
+	defer exe.Close()
 
 	// setns changes only the calling thread, and a child gets its namespaces
 	// from the thread that forks it. So this goroutine stays on one thread,
@@ -96,9 +101,10 @@ func execIn(ref string, argv []string) (int, error) {
 		return 0, fmt.Errorf("join pid namespace: %w", err)
 	}
 
-	cmd := exec.Command("/proc/self/exe", nsinit.ExecCommand)
+	cmd := exec.Command(exePath, nsinit.ExecCommand)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
-	cmd.ExtraFiles = append([]*os.File{pr}, nsFiles[1:]...) // fd 3, then spec.ExecNamespaces from fd 4
+	// spec.ExeFD, spec.InitPipeFD, then spec.ExecNamespaces from spec.ExecNamespaceFD
+	cmd.ExtraFiles = append([]*os.File{exe, pr}, nsFiles[1:]...)
 	cmd.Env = []string{}
 	// No Pdeathsig: Go's fork code checks that the child's parent is still
 	// alive by comparing getppid() with microbox's PID. microbox is outside

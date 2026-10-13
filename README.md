@@ -3,12 +3,14 @@
 A small Linux container runtime in Go, built to learn what happens underneath
 Docker: namespaces, `pivot_root`, cgroups v2 and veth networking.
 
-Status: milestones 1–5 of [PLAN.md](PLAN.md) are done (process isolation, the
-container filesystem, resource limits, networking and lifecycle management).
+Status: milestones 1–6 of [PLAN.md](PLAN.md) are done (process isolation, the
+container filesystem, resource limits, networking, lifecycle management and
+security).
 
 ## Try it
 
-Needs Linux (WSL2 works), root, iptables, and Go 1.22 or newer.
+Needs Linux on x86-64 (WSL2 works), root, iptables, and Go 1.22 or newer.
+`make build` builds a static binary (`CGO_ENABLED=0`), which `--init` needs.
 
 ```sh
 sudo scripts/get-alpine.sh            # Alpine minirootfs -> /var/lib/microbox/images/alpine
@@ -166,11 +168,15 @@ One binary, two processes.
    `/sys/fs/cgroup` showing only the container's own group, and a tmpfs
    `/dev` with only null, zero, full, random, urandom and tty, plus its own
    devpts, `/dev/shm` and `/dev/mqueue`.
-6. Writes `/etc/hostname`, `/etc/hosts` and `/etc/resolv.conf`. This happens
+6. Hides the parts of `/proc` and `/sys` that belong to the host kernel, and
+   makes others read-only (see Security).
+7. Writes `/etc/hostname`, `/etc/hosts` and `/etc/resolv.conf`. This happens
    after the pivot, so a symlink in the image can't point the write at a host
    file.
-7. Execs the command, which takes over PID 1. With `--init` it starts the
-   command as its child instead and stays PID 1 (see below).
+8. Drops capabilities, sets `no_new_privs` and installs the seccomp filter.
+9. Execs the command, which takes over PID 1. With `--init` it execs
+   microbox's reaper instead, which stays PID 1 and starts the command as its
+   child (see below).
 
 Details worth knowing:
 
@@ -227,7 +233,7 @@ execs the command. Joining the namespaces is split between the two:
 - `exec-init` joins the others (IPC, UTS, network, cgroup, mount) after it
   has started. This is the order that works:
   - If `exec` joined the mount namespace before forking, the kernel would
-    load microbox's binary with the container's `/`. A default build is
+    load microbox's binary with the container's `/`. A plain `go build` is
     dynamically linked (the `net` package pulls in cgo), so the kernel
     looks for `/lib64/ld-linux-x86-64.so.2` in the image. Alpine doesn't
     have it, so the exec fails with ENOENT.
@@ -242,11 +248,11 @@ execs the command. Joining the namespaces is split between the two:
     `unshare(CLONE_FS)` on the locked thread gives it its own copy, and then
     `setns` works from Go.
 
-**`--init`** keeps microbox's init as PID 1. It starts the command as a
-child, passes on every signal it receives, and reaps every child that
-exits, including orphans the kernel reparents to it. When the command
-exits, init exits with the same code, and the kernel kills whatever is left
-in the namespace. tini (`docker run --init`) does the same.
+**`--init`** keeps microbox as PID 1. It starts the command as a child,
+passes on every signal it receives, and reaps every child that exits,
+including orphans the kernel reparents to it. When the command exits, it
+exits with the same code, and the kernel kills whatever is left in the
+namespace. tini (`docker run --init`) does the same.
 
 **`gc`** cleans up after a supervisor that was killed. Its container died
 with it through Pdeathsig, but the cgroup, the address, any port rules and
@@ -257,16 +263,87 @@ addresses by the container ID in the reservation file, so it needs nothing
 from the dead process. The same cleanup function runs when a container
 exits normally.
 
+## Security
+
+Root in the container is still root on the host: there is no user namespace
+(see PLAN.md). The rest of Docker's default protections are there, so that
+root can't use the host's kernel against it:
+
+```
+$ sudo bin/microbox run --rm alpine sh -c '
+    grep -E "^(CapEff|NoNewPrivs|Seccomp):" /proc/self/status
+    mount -t tmpfs none /mnt; reboot -f; insmod /etc/hostname; unshare -U true
+    echo x > /proc/sys/kernel/domainname; wc -c < /proc/kcore'
+CapEff:	00000000a80425fb
+NoNewPrivs:	1
+Seccomp:	2
+mount: permission denied (are you root?)
+reboot: : Operation not permitted
+insmod: can't insert '/etc/hostname': Operation not permitted
+unshare: unshare(0x10000000): Operation not permitted
+sh: can't create /proc/sys/kernel/domainname: Read-only file system
+0
+```
+
+On the host the same `insmod` gets as far as `Invalid module format`, and
+`unshare -U` works.
+
+- **Capabilities.** Docker's default 14 of root's 41 (`a80425fb` above):
+  enough to `chown`, bind ports below 1024, `ping` and `mknod`, but not
+  `CAP_SYS_ADMIN` (mounts, most namespace work), `CAP_SYS_MODULE`,
+  `CAP_SYS_BOOT`, `CAP_SYS_PTRACE`, `CAP_NET_ADMIN` or `CAP_SYS_TIME`. init
+  removes the rest from the bounding set and empties the inheritable and
+  ambient sets. For root, execve then computes the new capabilities as the
+  bounding set plus the inheritable set, which leaves the 14.
+- **no_new_privs.** execve can't grant privileges any more, for instance
+  through a setuid binary in the image.
+- **seccomp.** A BPF program the kernel runs on every system call
+  (`internal/nsinit/seccomp_amd64.go`). It denies, with EPERM, what Docker's
+  profile leaves out: mounting, `unshare` and `setns`, kernel modules,
+  reboot and kexec, setting the clock, swap, the kernel keyring, `bpf`,
+  `perf_event_open`, `userfaultfd`, io_uring, `open_by_handle_at` (the
+  "shocker" escape) and a few obsolete calls. `clone` with a namespace flag
+  fails too. `clone3` gets ENOSYS, because BPF can't read its flags from
+  memory, and the C library falls back to `clone`. Calls from 32-bit or
+  x32 code kill the process, since their numbers differ from the table the
+  filter checks. Many of these already fail without the capabilities; the
+  ones that don't are the reason for the filter: `unshare -U` (a user
+  namespace needs no capability), the keyring and io_uring.
+- **Masked paths.** Parts of `/proc` and `/sys` aren't namespaced and show or
+  change the host: `/proc/kcore` is the host's memory, `/proc/sysrq-trigger`
+  acts on the host kernel. init binds `/dev/null` over files like those and
+  mounts an empty read-only tmpfs over directories, and makes `/proc/sys`,
+  `/proc/sysrq-trigger`, `/proc/bus`, `/proc/fs` and `/proc/irq` read-only.
+  Same lists as Docker.
+- **A sealed copy of microbox.** init, exec-init and the reaper run from a
+  copy of the binary in a sealed memfd, not from the file on the host. A
+  process's `/proc/<pid>/exe` leads to the file it runs, and if a process
+  in the container could open that link for a microbox process in the
+  container, it could overwrite microbox on the host. That was
+  CVE-2019-5736 in runc, which fixed it the same way.
+- **`--init`'s PID 1.** Capabilities, `no_new_privs` and seccomp filters
+  belong to a thread. init applies them on one locked thread and execs from
+  it, so the command gets them. The reaper runs for the container's whole
+  life, so instead of running it inside init, whose other Go threads would
+  keep every capability, init execs a fresh copy that starts from the
+  restricted thread. That exec happens after `pivot_root`, so the binary
+  has to be static. The reaper also makes itself non-dumpable, which closes
+  its `/proc/1/exe` and `/proc/1/mem` to processes without
+  `CAP_SYS_PTRACE`.
+
 ## Layout
 
 ```
 cmd/microbox/        CLI entry point: the commands, plus the hidden init, exec-init and shim
 internal/container/  host side: run, the shim and start/wait (run.go); the record (state.go);
-                     ps, stop, rm, logs, gc (manage.go); exec (exec.go)
+                     ps, stop, rm, logs, gc (manage.go); exec (exec.go); the sealed copy
+                     of the binary (binary.go)
 internal/cgroups/    cgroup v2 group per container: limits, OOM count, kill, removal
 internal/network/    bridge and NAT, IP allocation, veth + addressing, published ports, resolv.conf
 internal/nsinit/     container side: hostname, exec, exec-init (init.go); overlay, pivot_root,
-                     /dev, /etc (rootfs.go); the --init reaper (reap.go)
+                     /dev, masked paths, /etc (rootfs.go); the --init reaper (reap.go);
+                     capabilities and no_new_privs (security.go); the seccomp filter
+                     (seccomp_amd64.go)
 internal/spec/       config and exit codes shared by both sides
 e2e/                 tests that run the real binary
 scripts/get-alpine.sh
@@ -280,7 +357,8 @@ tests build the binary and run it against the alpine image. They check:
 - the hostname, and that the command is PID 1
 - `ps` sees only the container
 - all six namespace inodes differ from the host's
-- the exact list of container mounts (`/sys` read-only), and an unchanged host mount table
+- the exact list of container mounts (`/sys` and the masks read-only), and an
+  unchanged host mount table
 - `/dev` holds exactly the default devices and links
 - `/etc/hostname`, `/etc/hosts` and `/etc/resolv.conf`
 - writes and deletes stay in the container: the image and the next container don't
@@ -315,15 +393,25 @@ tests build the binary and run it against the alpine image. They check:
 - `logs -f` follows until the container exits
 - killing the supervisor leaves a dead container, and `gc` removes it and its leftovers
 - a `-d` container that fails to start leaves nothing behind
+- the command, an exec'd process and every thread of `--init`'s PID 1 have
+  Docker's capabilities, `no_new_privs` and a seccomp filter
+- `mount`, `reboot`, `insmod`, `unshare -U`, `unshare -m` and `date -s` fail,
+  and the container keeps running
+- `chown`, `mknod` and `ping` still work
+- `/proc/kcore` is empty, `/proc/sys` and `/proc/sysrq-trigger` are read-only,
+  `/sys/firmware` is empty
+- the container can't read `/proc/1/exe` of `--init`'s PID 1, which runs the
+  sealed memfd copy rather than the host's binary
 
 Unit tests cover size parsing, the limit files (including `cpu.max` rounding),
 the device-number encoding against the host's own `/dev` nodes, port and mode
-parsing, the `resolv.conf` filter, address allocation and parsing tagged
-iptables rules.
+parsing, the `resolv.conf` filter, address allocation, parsing tagged
+iptables rules, the capability mask, and the seccomp program, run through a
+small BPF interpreter on sample system calls.
 
 Without root or the image, the tests skip.
 
 ## Editing on Windows
 
 The code uses Linux-only syscalls. Open the folder through VS Code's WSL
-extension, or set `GOOS=linux` for gopls.
+extension, or set `GOOS=linux` and `GOARCH=amd64` for gopls.

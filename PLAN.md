@@ -90,14 +90,36 @@ Done when: a detached container survives the terminal closing, and after
 Not covered: container names, `start` for a stopped container, attaching to
 a detached one, a terminal for `exec` or `-d` (`-t`), and log rotation.
 
-## M6: security
+## M6: security (done)
 
-- Drop to Docker's default capability set, and set `no_new_privs`.
-- A seccomp deny-list.
-- Mask `/proc/kcore`, `/proc/sys` and similar. Mount with `nosuid,nodev`.
-- Optional user namespace (rootless).
+- Docker's default 14 capabilities: everything else leaves the bounding set,
+  and the inheritable and ambient sets are emptied. `no_new_privs`.
+- A seccomp deny-list in hand-written BPF, x86-64 only. It also blocks
+  `clone` with namespace flags and gives `clone3` ENOSYS, as Docker does.
+- Docker's masked and read-only paths in `/proc` and `/sys`. The special
+  mounts already had `nosuid,nodev` from M2.
+- The processes microbox runs inside containers start from a sealed memfd
+  copy of its binary (runc's fix for CVE-2019-5736).
+- `--init`'s PID 1 is now a fresh exec of microbox after the restrictions,
+  so all its threads have them, and it isn't dumpable. That exec needs a
+  static binary, so `make build` sets `CGO_ENABLED=0`, and `--init` checks
+  for it.
+- `run -d` and `stop` raced with init: a signal could reach microbox's init
+  before it had exec'd the command. The supervisor now waits on a pipe that
+  closes with that exec (fixed in M5's PR).
 
 Done when: `mount`, `reboot` and loading kernel modules fail inside the container.
+
+Not covered:
+- User namespaces (rootless containers, or root in the container mapped to
+  an unprivileged user). The image's files belong to the host's root, so
+  the container's root would need idmapped mounts or a chowned copy of each
+  image, and `mknod` stops working, so `/dev` would have to be bind mounts.
+- AppArmor or SELinux.
+- Options to change the defaults (`--cap-add`, `--privileged`, a seccomp
+  profile).
+- A seccomp filter for other architectures: microbox refuses to start
+  containers there.
 
 ## M7: images (stretch)
 
@@ -115,3 +137,10 @@ Pull OCI images from Docker Hub and stack their layers as overlay lowerdirs.
   namespaces it must happen before the runtime starts threads.
 - Cleanup has to be safe to repeat, because crashes leave veths, mounts and
   cgroups behind.
+- With cgroup2's `nsdelegate`, `CLONE_INTO_CGROUP` fails with ENOENT from
+  inside the target's cgroup namespace.
+- Exec'ing a dynamically linked binary after `pivot_root` or `setns` into a
+  mount namespace looks for its loader in the image.
+- Until init has exec'd the command, signals sent to PID 1 reach microbox.
+- Capabilities, `no_new_privs` and seccomp filters belong to a thread. In Go,
+  lock the thread before applying them and exec from it.

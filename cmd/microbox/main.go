@@ -61,6 +61,8 @@ func main() {
 		nsinit.Main()
 	case nsinit.ExecCommand:
 		nsinit.ExecMain()
+	case nsinit.ReapCommand:
+		nsinit.ReapMain()
 	case "help", "-h", "--help":
 		fmt.Print(usage)
 	default:

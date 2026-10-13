@@ -31,6 +31,9 @@ func setupRootfs(cfg *spec.Config) error {
 	if err := createDevices(); err != nil {
 		return err
 	}
+	if err := maskPaths(); err != nil {
+		return err
+	}
 	return writeEtcFiles(cfg)
 }
 
@@ -138,6 +141,57 @@ func createDevices() error {
 	for _, s := range devSymlinks {
 		if err := os.Symlink(s.target, s.link); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+// Files under /proc and /sys that show or change the host's kernel rather than
+// the container's, the same lists as Docker's. procfs isn't fully namespaced:
+// /proc/kcore is the host's memory, and most of /proc/sys and all of
+// /proc/sysrq-trigger act on the whole host. Paths this kernel doesn't have
+// are skipped.
+var (
+	// Hidden: /dev/null is bound over files, an empty read-only tmpfs mounted
+	// over directories.
+	MaskedPaths = []string{"/proc/acpi", "/proc/asound", "/proc/kcore", "/proc/keys",
+		"/proc/latency_stats", "/proc/timer_list", "/proc/timer_stats", "/proc/sched_debug",
+		"/proc/scsi", "/sys/firmware", "/sys/devices/virtual/powercap"}
+	// Readable but not writable.
+	ReadonlyPaths = []string{"/proc/bus", "/proc/fs", "/proc/irq", "/proc/sys", "/proc/sysrq-trigger"}
+)
+
+func maskPaths() error {
+	for _, p := range MaskedPaths {
+		fi, err := os.Stat(p)
+		if errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if fi.IsDir() {
+			err = syscall.Mount("tmpfs", p, "tmpfs", syscall.MS_RDONLY, "")
+		} else {
+			err = syscall.Mount("/dev/null", p, "", syscall.MS_BIND, "")
+		}
+		if err != nil {
+			return fmt.Errorf("mask %s: %w", p, err)
+		}
+	}
+	for _, p := range ReadonlyPaths {
+		if _, err := os.Stat(p); errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		// Bind the path onto itself, then remount that bind mount read-only.
+		// The remount sets the mount's flags rather than adding to them, so
+		// it repeats proc's nosuid, nodev and noexec.
+		if err := syscall.Mount(p, p, "", syscall.MS_BIND|syscall.MS_REC, ""); err != nil {
+			return fmt.Errorf("bind %s: %w", p, err)
+		}
+		flags := uintptr(syscall.MS_BIND | syscall.MS_REMOUNT | syscall.MS_RDONLY | syscall.MS_NOSUID | syscall.MS_NODEV | syscall.MS_NOEXEC)
+		if err := syscall.Mount(p, p, "", flags, ""); err != nil {
+			return fmt.Errorf("make %s read-only: %w", p, err)
 		}
 	}
 	return nil
