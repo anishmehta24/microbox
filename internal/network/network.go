@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 
 	"github.com/vishvananda/netlink"
@@ -48,17 +49,22 @@ type Endpoint struct {
 	Mode Mode
 	IP   net.IP // only in bridge mode
 
-	ipam     *ipam
-	rules    []rule // added for published ports, deleted by Teardown
-	proxies  []net.Listener
-	hostVeth string
+	id      string
+	proxies []net.Listener
 }
+
+// addrs hands out the container addresses.
+var addrs = &ipam{dir: filepath.Join(StateDir, "ips"), subnet: Subnet}
+
+// hostVeth names the host end of a container's veth pair. Interface names are
+// limited to 15 characters, which "mb" and a 12-character ID fit.
+func hostVeth(id string) string { return "mb" + id }
 
 // Prepare sets up everything that doesn't need the container process yet:
 // the shared bridge and NAT, an IP address, and the published ports. Doing the
 // ports first means a port that is already taken fails before anything starts.
 func Prepare(id string, mode Mode, ports []PortMapping) (*Endpoint, error) {
-	e := &Endpoint{Mode: mode}
+	e := &Endpoint{Mode: mode, id: id}
 	if len(ports) > 0 && mode != Bridge {
 		return nil, errors.New("publishing ports needs bridge networking")
 	}
@@ -68,13 +74,11 @@ func Prepare(id string, mode Mode, ports []PortMapping) (*Endpoint, error) {
 	if err := ensureHostNetwork(); err != nil {
 		return nil, err
 	}
-	e.ipam = &ipam{dir: filepath.Join(StateDir, "ips"), subnet: Subnet}
-	ip, err := e.ipam.allocate(id)
+	ip, err := addrs.allocate(id)
 	if err != nil {
 		return nil, err
 	}
 	e.IP = ip
-	e.hostVeth = "mb" + id // interface names are limited to 15 characters
 	for _, p := range ports {
 		if err := e.publish(p); err != nil {
 			e.Teardown()
@@ -100,7 +104,7 @@ func (e *Endpoint) Attach(pid int) error {
 		// A veth pair is a virtual cable. One end stays on the host, plugged
 		// into the bridge; the other is created inside the container.
 		veth := &netlink.Veth{
-			LinkAttrs:     netlink.LinkAttrs{Name: e.hostVeth, MasterIndex: br.Attrs().Index},
+			LinkAttrs:     netlink.LinkAttrs{Name: hostVeth(e.id), MasterIndex: br.Attrs().Index},
 			PeerName:      "eth0",
 			PeerNamespace: netlink.NsPid(pid),
 		}
@@ -158,30 +162,65 @@ func (e *Endpoint) configureInside(pid int) error {
 	return nil
 }
 
-// Teardown removes the ports, the veth pair and the IP reservation. It is safe
-// on a partly built endpoint. The container side needs no cleanup: its network
-// namespace, eth0 included, disappears with its last process.
+// Teardown stops the port proxies and then removes what Cleanup removes. It is
+// safe on a partly built endpoint. The container side needs no cleanup: its
+// network namespace, eth0 included, disappears with its last process.
 func (e *Endpoint) Teardown() error {
-	var errs []error
 	for _, ln := range e.proxies {
 		ln.Close()
 	}
-	for _, r := range e.rules {
+	if e.Mode != Bridge {
+		return nil
+	}
+	return Cleanup(e.id)
+}
+
+// Cleanup removes what bridge networking set up on the host for container id:
+// its port rules, its veth and its address. It finds them by the ID alone, so
+// it still works after the microbox process that set them up was killed
+// (microbox gc), and running it twice is harmless.
+func Cleanup(id string) error {
+	var errs []error
+	rules, err := listRules()
+	errs = append(errs, err)
+	for _, r := range rules[id] {
 		errs = append(errs, r.delete())
 	}
-	if e.hostVeth != "" {
-		// Deleting either end of a veth deletes both. The kernel does that by
-		// itself once the container's namespace is gone, but asynchronously.
-		if l, err := netlink.LinkByName(e.hostVeth); err == nil {
-			if err := netlink.LinkDel(l); err != nil && !errors.Is(err, syscall.ENODEV) {
-				errs = append(errs, err)
-			}
+	// Deleting either end of a veth deletes both. The kernel does that by
+	// itself once the container's namespace is gone, but asynchronously.
+	if l, err := netlink.LinkByName(hostVeth(id)); err == nil {
+		if err := netlink.LinkDel(l); err != nil && !errors.Is(err, syscall.ENODEV) {
+			errs = append(errs, err)
 		}
 	}
-	if e.IP != nil {
-		errs = append(errs, e.ipam.release(e.IP))
-	}
+	errs = append(errs, addrs.release(id))
 	return errors.Join(errs...)
+}
+
+// Owners returns the IDs of the containers that hold an address, a veth or
+// port rules on the host.
+func Owners() (map[string]bool, error) {
+	owners, err := addrs.owners()
+	if err != nil {
+		return nil, err
+	}
+	rules, err := listRules()
+	if err != nil {
+		return nil, err
+	}
+	for id := range rules {
+		owners[id] = true
+	}
+	links, err := netlink.LinkList()
+	if err != nil {
+		return nil, err
+	}
+	for _, l := range links {
+		if id, ok := strings.CutPrefix(l.Attrs().Name, "mb"); ok && l.Type() == "veth" {
+			owners[id] = true
+		}
+	}
+	return owners, nil
 }
 
 // ensureHostNetwork sets up what all containers share: the mb0 bridge holding

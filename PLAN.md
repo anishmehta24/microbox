@@ -62,20 +62,33 @@ Not covered: UDP ports, IPv6, and reaching a container's published port from
 another container through the host address. That last one needs hairpin NAT
 or `br_netfilter`.
 
-## M5: lifecycle
+## M5: lifecycle (done)
 
-- `run -d`, `ps`, `stop`, `rm`, `exec`, `logs`.
-- State in `/var/lib/microbox/containers/<id>/state.json`, moving created →
-  running → stopped.
+- `run -d`, `ps`, `stop`, `rm`, `exec`, `logs`, `gc`, and `--rm`.
+- A record per container, `/var/lib/microbox/containers/<id>/state.json`,
+  moving from created to running to exited. Containers stay until `rm`, as
+  in docker. A container whose supervisor was killed shows as dead.
+- `run -d` hands the container to a shim: microbox in a new session, with
+  the output going to a log file.
 - `stop` sends SIGTERM, waits, then writes `1` to `cgroup.kill`. `rm` is safe to
-  run twice. `gc` cleans up after crashes.
-- `exec` uses `setns` on `/proc/<pid>/ns/*`. Joining a mount namespace has to
-  happen before the Go runtime starts threads, so it needs a cgo constructor
-  (runc's `nsexec.c` approach).
-- `--init`: a small PID 1 that forwards signals and reaps zombies.
+  run twice. `gc` cleans up after crashes, finding port rules by an
+  `microbox:<id>` comment.
+- `exec` joins the PID namespace and forks `exec-init`, which joins the rest
+  itself. The plan was a cgo constructor like runc's `nsexec.c`, so that the
+  mount namespace is joined before the Go runtime starts threads. It turned
+  out that `unshare(CLONE_FS)` on a locked thread is enough, because the
+  kernel's actual condition is a thread that doesn't share its root and
+  working directory. Two more things only showed up when trying it:
+  joining the mount namespace before the fork made the exec look for glibc's
+  loader in the image, and cloning into the cgroup fails from inside the
+  container's cgroup namespace (`nsdelegate`).
+- `--init`: microbox's init stays PID 1, forwards signals and reaps zombies.
 
 Done when: a detached container survives the terminal closing, and after
 `stop` and `rm` no mount, cgroup, veth or iptables rule is left.
+
+Not covered: container names, `start` for a stopped container, attaching to
+a detached one, a terminal for `exec` or `-d` (`-t`), and log rotation.
 
 ## M6: security
 

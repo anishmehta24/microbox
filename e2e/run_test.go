@@ -53,8 +53,15 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
-// microbox runs `microbox run ARGS...` and returns its combined output and exit code.
+// microbox runs `microbox run --rm ARGS...` and returns its combined output and
+// exit code.
 func microbox(t *testing.T, args ...string) (string, int) {
+	t.Helper()
+	return cli(t, append([]string{"run", "--rm"}, args...)...)
+}
+
+// cli runs `microbox ARGS...` and returns its combined output and exit code.
+func cli(t *testing.T, args ...string) (string, int) {
 	t.Helper()
 	if skipReason != "" {
 		t.Skip(skipReason)
@@ -62,12 +69,21 @@ func microbox(t *testing.T, args ...string) (string, int) {
 	var out bytes.Buffer
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute) // a hung container fails the test instead of the run
 	defer cancel()
-	cmd := exec.CommandContext(ctx, bin, append([]string{"run"}, args...)...)
+	cmd := exec.CommandContext(ctx, bin, args...)
 	cmd.Stdout, cmd.Stderr = &out, &out
 	if err := cmd.Run(); err != nil && cmd.ProcessState == nil {
 		t.Fatalf("start microbox: %v", err)
 	}
 	return strings.TrimSpace(out.String()), cmd.ProcessState.ExitCode()
+}
+
+func mustCLI(t *testing.T, args ...string) string {
+	t.Helper()
+	out, code := cli(t, args...)
+	if code != 0 {
+		t.Fatalf("microbox %s: exit %d\n%s", strings.Join(args, " "), code, out)
+	}
+	return out
 }
 
 func mustRun(t *testing.T, args ...string) string {
@@ -221,6 +237,7 @@ func TestParallelContainersHaveOwnLayers(t *testing.T) {
 	})
 }
 
+// With --rm, which the microbox helper passes.
 func TestContainerDirRemovedAfterExit(t *testing.T) {
 	before := containerDirs(t)
 	mustRun(t, "alpine", "sh", "-c", "echo data > /tmp/f")
@@ -282,7 +299,7 @@ func TestKilledFromHostExits137(t *testing.T) {
 	if skipReason != "" {
 		t.Skip(skipReason)
 	}
-	cmd := exec.Command(bin, "run", "alpine", "sleep", "30")
+	cmd := exec.Command(bin, "run", "--rm", "alpine", "sleep", "30")
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
