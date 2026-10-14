@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    # GitHub's runners are full VMs with sudo, cgroup v2, overlayfs and
+    # iptables, so the e2e tests run here as they do locally.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+      - name: Download the alpine image
+        run: make rootfs
+      - name: Test
+        shell: bash
+        run: |
+          make test TESTFLAGS=-v 2>&1 | tee test.log
+          # The e2e tests skip without root or the image. Here all must run.
+          if grep -e '--- SKIP' test.log; then exit 1; fi
+
+  # Pushing a tag like v0.1.0 publishes a release with the static binary.
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: test
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+      - name: Build
+        run: |
+          CGO_ENABLED=0 go build -trimpath -o microbox-linux-amd64 ./cmd/microbox
+          # Go takes the version from the tag of the commit it builds.
+          test "$(./microbox-linux-amd64 version)" = "microbox $GITHUB_REF_NAME"
+          sha256sum microbox-linux-amd64 > SHA256SUMS
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" microbox-linux-amd64 SHA256SUMS --verify-tag --generate-notes
