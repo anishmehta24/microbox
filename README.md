@@ -1,5 +1,7 @@
 # MicroBox
 
+[![CI](https://github.com/anishmehta24/microbox/actions/workflows/ci.yml/badge.svg)](https://github.com/anishmehta24/microbox/actions/workflows/ci.yml)
+
 A small Linux container runtime in Go, built to learn what happens underneath
 Docker: namespaces, `pivot_root`, cgroups v2, veth networking and OCI images.
 
@@ -9,8 +11,19 @@ management, security and images).
 
 ## Try it
 
-Needs Linux on x86-64 (WSL2 works), root, iptables, and Go 1.25 or newer.
-`make build` builds a static binary (`CGO_ENABLED=0`), which `--init` needs.
+Needs Linux 5.14 or newer on x86-64 (WSL2 works), with cgroup v2, root and
+iptables. Each [release](https://github.com/anishmehta24/microbox/releases)
+has a static binary:
+
+```sh
+curl -fLO https://github.com/anishmehta24/microbox/releases/latest/download/microbox-linux-amd64
+curl -fLO https://github.com/anishmehta24/microbox/releases/latest/download/SHA256SUMS
+sha256sum -c SHA256SUMS && sudo install microbox-linux-amd64 /usr/local/bin/microbox
+```
+
+Or `CGO_ENABLED=0 go install github.com/anishmehta24/microbox/cmd/microbox@latest`
+with Go 1.25 or newer. The examples here use a checkout, where `make build`
+builds the same static binary (`CGO_ENABLED=0`), which `--init` needs:
 
 ```sh
 make build
@@ -437,6 +450,7 @@ internal/nsinit/     container side: hostname, exec, exec-init (init.go); overla
 internal/spec/       config and exit codes shared by both sides
 e2e/                 tests that run the real binary
 scripts/get-alpine.sh
+.github/workflows/   CI: the tests on every push, and releases from tags
 ```
 
 ## Tests
@@ -516,7 +530,12 @@ small BPF interpreter on sample system calls. For images:
   fail the pull without touching anything outside
 - unused-layer removal
 
-Without root or the image, the tests skip.
+Without root or the image, the tests skip. CI runs `make test` on every push
+and pull request, on GitHub's Ubuntu 24.04 runners, and fails if any test
+skipped.
+
+Pushing a tag such as `v0.1.0` runs the tests and then publishes a release
+with the static binary and its SHA-256. `microbox version` prints the tag.
 
 ## Editing on Windows
 

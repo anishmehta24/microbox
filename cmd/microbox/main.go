@@ -5,6 +5,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"runtime/debug"
 
 	"github.com/anishmehta24/microbox/internal/container"
 	"github.com/anishmehta24/microbox/internal/nsinit"
@@ -23,6 +24,7 @@ Commands:
   images                                 list images
   rmi IMAGE...                           remove images (gc removes their layers)
   gc                                     clean up after killed microbox processes, and unused layers
+  version                                print microbox's version
 
 IMAGE is a pulled image such as alpine:3.20, a directory under /var/lib/microbox/images,
 or a path to a root filesystem starting with / or ./
@@ -73,6 +75,8 @@ func main() {
 		nsinit.ReapMain()
 	case "help", "-h", "--help":
 		fmt.Print(usage)
+	case "version", "--version":
+		fmt.Println("microbox", version())
 	default:
 		run, ok := commands[cmd]
 		if !ok {
@@ -81,4 +85,14 @@ func main() {
 		}
 		os.Exit(run(os.Args[2:]))
 	}
+}
+
+// version is the one Go records in the binary: the tag for a build of a
+// tagged commit or for `go install ...@v0.1.0`, otherwise a pseudo-version
+// made from the commit, or "(devel)" outside a git checkout.
+func version() string {
+	if info, ok := debug.ReadBuildInfo(); ok {
+		return info.Main.Version
+	}
+	return "(unknown)"
 }
